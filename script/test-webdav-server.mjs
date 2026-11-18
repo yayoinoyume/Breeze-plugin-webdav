@@ -60,6 +60,19 @@ export function createFixture() {
     { level: 0 }
   );
 
+  const comicsPage1 = makePngLike(180 * 1024, 31);
+  const comicsPage2 = makePngLike(200 * 1024, 32);
+  const comicsPage3 = makePngLike(160 * 1024, 33);
+  const percentPage = makePngLike(140 * 1024, 41);
+  const comicsCbz = zipSync(
+    {
+      "010.png": makePngLike(1_200_000, 34),
+      "2.png": makePngLike(1_100_000, 35),
+      "001.png": makePngLike(1_000_000, 36)
+    },
+    { level: 0 }
+  );
+
   const root = dir({
     "第 01 页.png": file(page1),
     "page-02.png": file(page2),
@@ -68,6 +81,17 @@ export function createFixture() {
     子目录: dir({
       "a.png": file(subPage1),
       "b.png": file(subPage2)
+    }),
+    comics: dir({
+      目录漫画: dir({
+        "010.png": file(comicsPage1),
+        "2.png": file(comicsPage2),
+        "001.png": file(comicsPage3)
+      }),
+      "100%20": dir({
+        "a%20b.png": file(percentPage)
+      }),
+      "整包.cbz": file(comicsCbz)
     })
   });
 
@@ -83,7 +107,7 @@ export function createFixture() {
   };
   walk(root, "/");
 
-  return { root, files, cbz };
+  return { root, files, cbz, comicsCbz };
 }
 
 function isAuthorized(req, user, pass) {

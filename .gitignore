@@ -1,5 +1,5 @@
 node_modules/
 dist/
 .work/
-docs/work/
+docs/
 *.log

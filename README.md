@@ -45,15 +45,17 @@
 - 目录的直接子项里有图片 → 该目录是一本漫画，**不再向下钻**；
 - 目录里没有图片 → 继续向下找，直到扫描深度用完；
 - 同级的 .cbz / .zip 文件各自算一本漫画（开关打开时）；
-- 关键词只过滤漫画名，大小写不敏感；每页 20 本。
+- 关键词只过滤漫画名，大小写不敏感；每页 20 本；
+- 一次扫描最多发 2000 次 PROPFIND，超过就停止并提示「结果可能不完整」；
+- 扫描结果缓存 45 秒，翻页不会重新全量扫描。
 
 ## 支持 / 不支持
 
 **支持**
 
 - WebDAV 的 PROPFIND 列目录（通过宿主全局 __http_request_promise 发，标准 fetch 发不出 PROPFIND）；
-- Basic 认证、中文 / 空格路径的百分号编码；
-- 图片文件夹与 CBZ/ZIP；
+- Basic 认证、中文 / 空格路径的百分号编码；文件名里的字面 %20 按字面量处理（% 会编码成 %25），不会二次解码；
+- 图片文件夹与 CBZ/ZIP；跨站点的绝对 URL 会被拒绝，不会把认证头发到别的 host；
 - CBZ 中央目录解析 + 单页 inflate；最近 2 个整包放模块内 LRU；
 - 网盘返回 401/403、PROPFIND 405/501、宿主过旧、请求超时的中文提示。
 
@@ -61,7 +63,7 @@
 
 - PDF（任务范围外）；
 - 目录逐级钻进 UI：一本漫画就是「单章全一话」，不提供卷/话树；
-- 压缩包加密、ZIP64（>4GB 或条目数 >65535）；
+- 压缩包加密；ZIP64 结构（条目数达到 65535，或单条目尺寸达到 4 GiB 时判定为 ZIP64）；
 - 需要登录页 / Cookie / Token 的网盘，只支持 Basic 认证；
 - 修改服务器上的文件（只读）。
 
@@ -70,6 +72,11 @@
 - **单次请求 30 秒硬超时**：宿主对每次 HTTP 请求固定 30 秒超时，插件侧改不了。图片太大或网盘太慢会失败，提示「网盘太慢或文件太大，下载超时」。
 - **CBZ 要整包下载**：打开 CBZ 漫画或取它的第一张封面时，会按 Range 分块把整包拉下来（默认 8 MiB 一块），再在本地解压单页。包越大越慢、越吃内存；LRU 只留最近 2 个包。
 - **封面也是按需取图**：列表里的封面是 wdav:// 占位地址，宿主真正加载封面时才去下载；CBZ 封面会触发整包下载。
+- **下载与解压上限**：单个文件最多 512 MiB；CBZ 单页解压后最多 64 MiB，压缩比超过 1000:1 视为异常并拒绝。
+- **拿不到文件长度就不下载**：HEAD 没有 Content-Length 时改用 GET Range 0-0 读 Content-Range；两样都探测失败会明确报「服务器不支持分块下载，也拿不到文件长度」，不会盲发整包 GET 撞 30 秒超时。
+- **并发抓图**：宿主默认并发 5；同一 CBZ 的多个页面共享一次整包下载（in-flight 去重），最多同时保留 2 个整包。
+- **扫描广度上限**：一次扫描最多 2000 次列目录请求；大库会返回已发现结果并附带中文提示，结果可能不完整。
+- **扫描缓存**：同一套设置 45 秒内复用上次结果；刚往网盘加了漫画，最多等 45 秒再刷新。
 - **密码明文保存**：密码是普通设置字段，宿主只做遮挡显示，落盘未见加密（与 Breeze 其他插件的设置一致）。
 - **PROPFIND 依赖未文档化全局**：__http_request_promise 不是官方文档 API，Breeze 未来若收紧会失效。
 - **图片字节不进宿主 cache**：宿主 cache 单值上限 500 KiB，图片只走模块内 LRU 或直取。
@@ -86,7 +93,7 @@ node script/e2e-webdav.mjs
 产物是 dist/breeze-plugin-webdav.bundle.cjs（CJS 单文件，依赖全部内联），同时生成根目录 manifest.json。
 
 - script/test-webdav-server.mjs：用 node:http 手写的测试 WebDAV 服务器（Basic 认证、PROPFIND 0/1/infinity、GET/HEAD、Range）；
-- script/e2e-webdav.mjs：加载打包产物，跑「目录漫画」和「CBZ 漫画」两条完整链路，最后输出 E2E PASS dir=... cbz=...。
+- script/e2e-webdav.mjs：加载打包产物，分别以 rootPath=/ 和 rootPath=/comics 跑「目录漫画 + CBZ 漫画」完整链路，最后输出 E2E PASS，带两组 dir=/cbz=。
 
 ## 代码结构
 
@@ -99,7 +106,7 @@ src/
   errors.ts           中文错误提示归类
   util/names.ts       自然排序、扩展名、路径小工具
   webdav/xml.ts       手写 DAV multistatus 解析
-  webdav/client.ts    PROPFIND / Basic 认证 / URL 编码 / href 换算
+  webdav/client.ts    PROPFIND / Basic 认证 / URL 编码 / href 换算 / 跨站拦截
   webdav/scan.ts      BFS 扫描漫画
   webdav/ids.ts       漫画 id / 页面 url 的可逆编码
   zip/cbz.ts          最小 ZIP/CBZ 读取器（中央目录 + 单页解压）

@@ -6,6 +6,8 @@
 
 import { hostRequest } from "../http/host.ts";
 import type { HostRequest, HttpResponseData } from "../http/host.ts";
+import { redactUrl } from "../errors.ts";
+import { normalizeDavPath } from "../util/names.ts";
 import { parseMultistatus } from "./xml.ts";
 import type { DavEntry } from "./xml.ts";
 
@@ -14,8 +16,6 @@ export type WebDavClientOptions = {
   baseUrl: string;
   username?: string;
   password?: string;
-  /** 漫画库在服务器上的根路径，默认 "/"。 */
-  rootPath?: string;
   /** 便于测试替换的请求实现。 */
   request?: HostRequest;
 };
@@ -39,7 +39,6 @@ export const PROPFIND_BODY =
   "<displayname/><getcontentlength/><getlastmodified/><resourcetype/>" +
   "</prop></propfind>";
 
-const PERCENT_TRIPLET = /^[0-9A-Fa-f]{2}$/;
 const BASE64_TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 function encodeCodePoint(char: string): string {
@@ -50,24 +49,13 @@ function encodeCodePoint(char: string): string {
   }
 }
 
-/** 逐段编码路径；已有 %XX 转义原样保留，避免二次编码。 */
+/** 逐段编码路径。内部路径一律视为已解码字面量：% 会编码成 %25。 */
 export function encodePath(path: string): string {
   return String(path ?? "")
     .split("/")
     .map((segment) => {
       let out = "";
-      const chars = Array.from(segment);
-      for (let index = 0; index < chars.length; index += 1) {
-        const char = chars[index];
-        if (
-          char === "%" &&
-          index + 2 < chars.length &&
-          PERCENT_TRIPLET.test(chars[index + 1] + chars[index + 2])
-        ) {
-          out += `%${chars[index + 1]}${chars[index + 2]}`.toUpperCase();
-          index += 2;
-          continue;
-        }
+      for (const char of Array.from(segment)) {
         out += encodeCodePoint(char);
       }
       return out;
@@ -80,26 +68,54 @@ function encodeAbsoluteUrl(url: string): string {
   if (!matched) {
     return url;
   }
-  const origin = matched[1];
+  const origin = matched[1].replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, "$1");
   const path = matched[2] === "" ? "/" : matched[2];
   return `${origin}${encodePath(path)}${matched[3]}`;
 }
 
-/** 把服务器地址规范化：补协议、去掉结尾斜杠。 */
+/** 把服务器地址规范化：补协议、剥离 userinfo、去掉结尾斜杠。 */
 export function normalizeBaseUrl(raw: string): string {
   const trimmed = String(raw ?? "").trim();
   if (trimmed === "") {
     throw new Error("未配置 WebDAV 服务器地址（baseUrl）");
   }
   const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
-  return withScheme.replace(/\/+$/, "");
+  const matched = /^([a-z][a-z0-9+.-]*:\/\/)([^/?#]*)([\s\S]*)$/i.exec(withScheme);
+  if (matched === null) {
+    throw new Error("WebDAV 服务器地址格式不对");
+  }
+  let authority = matched[2];
+  const at = authority.lastIndexOf("@");
+  if (at >= 0) {
+    authority = authority.slice(at + 1);
+  }
+  if (authority === "") {
+    throw new Error("WebDAV 服务器地址格式不对（缺少主机名）");
+  }
+  return (matched[1] + authority + matched[3]).replace(/\/+$/, "");
 }
 
-/** 相对路径拼到根 URL 上；已经是绝对 URL 的输入只做安全编码。 */
+/** URL 的 origin（scheme://host:port，去掉 userinfo）。 */
+export function originOf(url: string): string {
+  const matched = /^([a-z][a-z0-9+.-]*):\/\/([^/?#]*)/i.exec(String(url ?? ""));
+  if (matched === null) {
+    return "";
+  }
+  const authority = matched[2].replace(/^.*@/, "");
+  return (matched[1] + "://" + authority).toLowerCase();
+}
+
+/** 相对路径拼到根 URL 上；绝对 URL 只允许同 origin，且只做安全编码。 */
 export function resolveUrl(rootUrl: string, input: string): string {
   const raw = String(input ?? "").trim();
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
-    return encodeAbsoluteUrl(raw);
+    const encoded = encodeAbsoluteUrl(raw);
+    const baseOrigin = originOf(rootUrl);
+    const targetOrigin = originOf(encoded);
+    if (baseOrigin !== "" && targetOrigin !== "" && baseOrigin !== targetOrigin) {
+      throw new Error("不允许访问其他站点的地址：" + redactUrl(encoded));
+    }
+    return encoded;
   }
   const base = rootUrl.replace(/\/+$/, "");
   const suffix = raw === "" ? "/" : raw.startsWith("/") ? raw : `/${raw}`;
@@ -192,31 +208,32 @@ export function hrefToRelativePath(href: string, rootUrl: string): string | null
     return "/";
   }
   if (rootPath === "/") {
-    return hrefPath;
+    return normalizeDavPath(hrefPath);
   }
   if (!hrefPath.startsWith(rootPath + "/")) {
     return null;
   }
-  return hrefPath.slice(rootPath.length);
+  return normalizeDavPath(hrefPath.slice(rootPath.length));
 }
 
 function describeHttpError(method: string, url: string, response: HttpResponseData): Error {
   const status = response.status;
+  const safeUrl = redactUrl(url);
   if (status === 401 || status === 403) {
-    return new Error("网盘用户名或密码不对（HTTP " + status + "）：" + method + " " + url);
+    return new Error("网盘用户名或密码不对（HTTP " + status + "）：" + method + " " + safeUrl);
   }
   if (method === "PROPFIND" && (status === 405 || status === 501)) {
     return new Error(
       "这个网盘不支持列目录（PROPFIND），换一个 WebDAV 地址试试（HTTP " + status + "）"
     );
   }
-  return new Error("WebDAV 请求失败（HTTP " + status + "）：" + method + " " + url);
+  return new Error("WebDAV 请求失败（HTTP " + status + "）：" + method + " " + safeUrl);
 }
 
 export function createWebDavClient(options: WebDavClientOptions): WebDavClient {
   const baseUrl = normalizeBaseUrl(options.baseUrl);
-  const rootPath = String(options.rootPath ?? "/").trim() || "/";
-  const rootUrl = resolveUrl(baseUrl, rootPath);
+  // 只在这里设一次根：rootPath 由扫描层作为路径的一部分拼进来，客户端不再二次拼接。
+  const rootUrl = baseUrl;
   const request = options.request ?? hostRequest;
   const authorization = buildBasicAuthHeader(options.username, options.password);
 
@@ -249,7 +266,15 @@ export function createWebDavClient(options: WebDavClientOptions): WebDavClient {
       if (response.status !== 207 && response.status !== 200) {
         throw describeHttpError("PROPFIND", url, response);
       }
-      return parseMultistatus(decodeUtf8(response.bytes));
+      const xmlText = decodeUtf8(response.bytes);
+      if (response.status === 200) {
+        const contentType = String(response.headers["content-type"] ?? "").toLowerCase();
+        const looksHtml = /^\s*<(!doctype\s+html|html)\b/i.test(xmlText);
+        if ((contentType !== "" && !/xml|dav/.test(contentType)) || looksHtml) {
+          throw new Error("这个地址不是 WebDAV 根（PROPFIND 没返回 DAV XML）");
+        }
+      }
+      return parseMultistatus(xmlText);
     },
     async list(input = "/", depth = 1) {
       const url = client.urlFor(input);

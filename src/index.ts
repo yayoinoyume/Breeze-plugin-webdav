@@ -22,6 +22,7 @@ export {
   hrefToRelativePath,
   listDirectory,
   normalizeBaseUrl,
+  originOf,
   resolveUrl
 } from "./webdav/client.ts";
 export type { WebDavClient, WebDavClientOptions } from "./webdav/client.ts";
@@ -29,8 +30,11 @@ export { hostRequest } from "./http/host.ts";
 export type { HostRequest, HttpRequestSpec, HttpResponseData } from "./http/host.ts";
 export {
   DEFAULT_CHUNK_SIZE,
+  MAX_DOWNLOAD_BYTES,
   downloadFileBytes,
-  headContentLength
+  headContentLength,
+  parseContentRange,
+  probeContentLength
 } from "./http/download.ts";
 export type { DownloadOptions, DownloadResult } from "./http/download.ts";
 export {
@@ -50,9 +54,20 @@ export {
   parsePageUrl
 } from "./webdav/ids.ts";
 export type { ComicKind, ComicRef } from "./webdav/ids.ts";
-export { scanComics, sortImagePaths } from "./webdav/scan.ts";
-export type { ComicEntry, ComicLister, ScanOptions } from "./webdav/scan.ts";
-export { extractZipEntry, listZipImages, readZipEntries } from "./zip/cbz.ts";
+export {
+  DEFAULT_MAX_LIST_CALLS,
+  scanComics,
+  scanComicsDetailed,
+  sortImagePaths
+} from "./webdav/scan.ts";
+export type { ComicEntry, ComicLister, ScanOptions, ScanResult } from "./webdav/scan.ts";
+export {
+  MAX_COMPRESSION_RATIO,
+  MAX_ENTRY_BYTES,
+  extractZipEntry,
+  listZipImages,
+  readZipEntries
+} from "./zip/cbz.ts";
 export type { ZipEntry } from "./zip/cbz.ts";
 export {
   baseName,
@@ -66,6 +81,7 @@ export {
 export {
   USER_MESSAGES,
   friendlyMessage,
+  redactUrl,
   toFriendlyError,
   withFriendlyErrors
 } from "./errors.ts";
@@ -74,6 +90,7 @@ export {
   SEARCH_PAGE_SIZE,
   buildChapterWithPages,
   buildListItem,
+  clearScanCache,
   clearZipCache,
   clientForSettings,
   fetchImageBytes,
@@ -83,7 +100,9 @@ export {
   getComicDetail,
   getComicList,
   getReadSnapshot,
+  getLastScanWarning,
   listComicEntries,
+  listComicEntriesDetailed,
   paginateComics,
   resolveComicRef,
   searchComic,

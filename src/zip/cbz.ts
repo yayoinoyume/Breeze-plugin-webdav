@@ -17,6 +17,9 @@ export type ZipEntry = {
   localOffset: number;
 };
 
+export const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
+export const MAX_COMPRESSION_RATIO = 1000;
+
 const EOCD_SIGNATURE = 0x06054b50;
 const CENTRAL_SIGNATURE = 0x02014b50;
 const LOCAL_SIGNATURE = 0x04034b50;
@@ -117,10 +120,21 @@ export function listZipImages(entries: ZipEntry[]): ZipEntry[] {
     .sort((left, right) => naturalCompare(left.name, right.name));
 }
 
-/** 解压单个条目。支持 stored(0) 与 deflate(8)。 */
+/** 解压单个条目。支持 stored(0) 与 deflate(8)，并限制解压体积与压缩比。 */
 export function extractZipEntry(zipBytes: Uint8Array, entry: ZipEntry): Uint8Array {
   if ((entry.flags & 1) !== 0) {
     throw new Error("CBZ 里的文件被加密了，暂不支持");
+  }
+  if (entry.uncompressedSize > MAX_ENTRY_BYTES) {
+    throw new Error(
+      "CBZ 里的这一页解压后太大（超过 " + MAX_ENTRY_BYTES / (1024 * 1024) + " MiB），暂不支持"
+    );
+  }
+  if (
+    entry.compressedSize > 0 &&
+    entry.uncompressedSize / entry.compressedSize > MAX_COMPRESSION_RATIO
+  ) {
+    throw new Error("CBZ 压缩比异常（可能损坏或恶意包），已拒绝解压");
   }
   if (entry.localOffset + 30 > zipBytes.length) {
     throw new Error("CBZ 条目偏移损坏");
@@ -138,17 +152,22 @@ export function extractZipEntry(zipBytes: Uint8Array, entry: ZipEntry): Uint8Arr
   const compressed = zipBytes.subarray(dataStart, dataEnd);
 
   if (entry.method === 0) {
-    return compressed.slice();
+    if (entry.compressedSize !== entry.uncompressedSize) {
+      throw new Error("CBZ 条目尺寸不一致（stored）");
+    }
+    return compressed.slice(0, entry.uncompressedSize);
   }
   if (entry.method === 8) {
-    if (entry.uncompressedSize > 0) {
-      try {
-        return inflateSync(compressed, { out: new Uint8Array(entry.uncompressedSize) });
-      } catch {
-        // 有些包的中央目录尺寸不准，退回不定长解压。
-      }
+    const inflated = inflateSync(compressed);
+    if (inflated.length > MAX_ENTRY_BYTES) {
+      throw new Error(
+        "CBZ 里的这一页解压后太大（超过 " + MAX_ENTRY_BYTES / (1024 * 1024) + " MiB），暂不支持"
+      );
     }
-    return inflateSync(compressed);
+    if (entry.uncompressedSize > 0 && inflated.length !== entry.uncompressedSize) {
+      throw new Error("CBZ 解压长度与中央目录不一致");
+    }
+    return inflated.subarray(0, inflated.length);
   }
   throw new Error("CBZ 使用了不支持的压缩方式：" + String(entry.method));
 }

@@ -31,15 +31,22 @@ function encodeBase64(bytes: Uint8Array): string {
   return out;
 }
 
-function decodeBase64(text: string): Uint8Array {
-  const cleaned = String(text ?? "").replace(/[^A-Za-z0-9+/]/g, "");
+function decodeBase64Strict(text: string): Uint8Array | null {
+  const raw = String(text ?? "");
+  if (raw === "" || !/^[A-Za-z0-9_-]+$/.test(raw)) {
+    return null;
+  }
+  if (raw.length % 4 === 1) {
+    return null;
+  }
+  const normalized = raw.replace(/-/g, "+").replace(/_/g, "/");
   const bytes: number[] = [];
   let buffer = 0;
   let bits = 0;
-  for (const char of cleaned) {
+  for (const char of normalized) {
     const value = BASE64_TABLE.indexOf(char);
     if (value < 0) {
-      continue;
+      return null;
     }
     buffer = (buffer << 6) | value;
     bits += 6;
@@ -48,7 +55,12 @@ function decodeBase64(text: string): Uint8Array {
       bytes.push((buffer >> bits) & 0xff);
     }
   }
-  return Uint8Array.from(bytes);
+  const bytesArray = Uint8Array.from(bytes);
+  const canonical = encodeBase64(bytesArray)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  return canonical === raw ? bytesArray : null;
 }
 
 /** UTF-8 文本 → base64url（无补位）。 */
@@ -57,14 +69,25 @@ export function encodePathId(path: string): string {
   return encodeBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** base64url → UTF-8 文本；非法输入返回空串。 */
+/** base64url → UTF-8 文本；非法输入、控制字符、NUL 一律返回空串。 */
 export function decodePathId(id: string): string {
+  const bytes = decodeBase64Strict(id);
+  if (bytes === null) {
+    return "";
+  }
+  let text = "";
   try {
-    const normalized = String(id ?? "").replace(/-/g, "+").replace(/_/g, "/");
-    return new TextDecoder("utf-8").decode(decodeBase64(normalized));
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
     return "";
   }
+  if (text === "" || text.includes("\uFFFD")) {
+    return "";
+  }
+  if (/[\u0000-\u001F\u007F]/.test(text)) {
+    return "";
+  }
+  return text;
 }
 
 export function encodeComicId(kind: ComicKind, path: string): string {

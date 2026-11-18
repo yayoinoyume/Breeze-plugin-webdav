@@ -97,3 +97,32 @@ test("plugin-fetch CBZ 页与 fixture 一致，整包只下载一次（LRU）", 
   const expected = unzipSync(zipBytes)["p2.png"];
   assert.equal(sha256(third), sha256(expected));
 });
+
+
+test("cbz-inflight 5 个并发取同一 CBZ 的页只下载一次整包", async () => {
+  const requests = [];
+  const client = makeClient(requests);
+  clearZipCache();
+
+  const pages = await Promise.all([
+    fetchPageBytes(client, { kind: "cbz", path: "/合集.cbz", index: 0 }),
+    fetchPageBytes(client, { kind: "cbz", path: "/合集.cbz", index: 1 }),
+    fetchPageBytes(client, { kind: "cbz", path: "/合集.cbz", index: 2 }),
+    fetchPageBytes(client, { kind: "cbz", path: "/合集.cbz", index: 0 }),
+    fetchPageBytes(client, { kind: "cbz", path: "/合集.cbz", index: 1 })
+  ]);
+
+  assert.equal(pages.length, 5);
+  assert.deepEqual(pages.map((bytes) => sha256(bytes)), [
+    sha256(zipFiles["p1.png"]),
+    sha256(zipFiles["p2.png"]),
+    sha256(zipFiles["p10.png"]),
+    sha256(zipFiles["p1.png"]),
+    sha256(zipFiles["p2.png"])
+  ]);
+
+  const packageGets = requests.filter(
+    (spec) => spec.method === "GET" && spec.url.endsWith(".cbz")
+  );
+  assert.equal(packageGets.length, 1, "并发取图应共享同一次整包下载");
+});

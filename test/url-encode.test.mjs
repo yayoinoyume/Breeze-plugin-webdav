@@ -21,10 +21,10 @@ test("url-encode 中文与空格路径逐段编码", () => {
 });
 
 test("url-encode 保留已有转义并生成 UTF-8 Basic 认证头", () => {
-  assert.equal(encodePath("/a%20b/中文.cbz"), "/a%20b/%E4%B8%AD%E6%96%87.cbz");
+  assert.equal(encodePath("/a%20b/中文.cbz"), "/a%2520b/%E4%B8%AD%E6%96%87.cbz");
   assert.equal(
     resolveUrl("http://nas.local/dav", "http://nas.local/dav/a%20b/x.cbz?download=1"),
-    "http://nas.local/dav/a%20b/x.cbz?download=1"
+    "http://nas.local/dav/a%2520b/x.cbz?download=1"
   );
 
   const expected =

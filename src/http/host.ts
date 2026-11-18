@@ -6,6 +6,8 @@
  * 所以这里直接调它。响应体默认 offload 到 native buffer，用 native.take 取回。
  */
 
+import { redactUrl } from "../errors.ts";
+
 export type HttpRequestSpec = {
   method: string;
   url: string;
@@ -86,9 +88,11 @@ export const hostRequest: HostRequest = async (spec) => {
 
   if (payload.ok === false) {
     if (payload.canceled === true) {
-      throw new Error(`请求已取消：${spec.method} ${spec.url}`);
+      throw new Error(`请求已取消：${spec.method} ${redactUrl(spec.url)}`);
     }
-    throw new Error(`请求失败：${spec.method} ${spec.url}：${payload.error ?? "未知错误"}`);
+    throw new Error(
+      `请求失败：${spec.method} ${redactUrl(spec.url)}：${payload.error ?? "未知错误"}`
+    );
   }
 
   const headers: Record<string, string> = {};

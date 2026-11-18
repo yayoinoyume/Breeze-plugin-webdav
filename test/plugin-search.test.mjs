@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { decodeComicId } from "../src/webdav/ids.ts";
-import { buildListItem, filterComics, paginateComics, searchComicsWith } from "../src/comics.ts";
-import { scanComics } from "../src/webdav/scan.ts";
+import {
+  buildListItem,
+  clearScanCache,
+  filterComics,
+  paginateComics,
+  searchComicsWith
+} from "../src/comics.ts";
+import { scanComics, scanComicsDetailed } from "../src/webdav/scan.ts";
 
 function entry(href, isCollection = false, size = null) {
   return {
@@ -122,4 +128,44 @@ test("plugin-search 数量上限与分页", async () => {
   const decoded = decodeComicId(item.id);
   assert.equal(decoded?.kind, "dir");
   assert.equal(item.cover.url.startsWith("wdav://"), true);
+});
+
+
+test("scan-budget 列目录请求达到上限时停止并给中文提示", async () => {
+  const result = await scanComicsDetailed(fakeLister(), {
+    rootPath: "/系列A",
+    scanDepth: 3,
+    includeCbz: true,
+    maxListCalls: 1
+  });
+
+  assert.equal(result.listCalls, 1);
+  assert.match(String(result.warning), /目录太多.*上限 1 次/);
+  assert.equal(result.comics.length, 0, "只扫了第一层，尚未发现漫画");
+});
+
+
+test("scan-cache 翻页复用 45 秒内的扫描结果", async () => {
+  let calls = 0;
+  const lister = fakeLister();
+  const client = {
+    list: async (input, depth) => {
+      calls += 1;
+      return lister.list(input, depth);
+    },
+    relativePath: (href) => lister.relativePath(href)
+  };
+  const settings = { ...SETTINGS, baseUrl: "http://cache.local/dav" };
+
+  clearScanCache();
+  await searchComicsWith(client, settings, "", 1);
+  const afterFirst = calls;
+  assert.ok(afterFirst > 0);
+
+  await searchComicsWith(client, settings, "", 2);
+  assert.equal(calls, afterFirst, "第二页不应重新扫描");
+
+  clearScanCache();
+  await searchComicsWith(client, settings, "", 1);
+  assert.ok(calls > afterFirst, "清缓存后应重新扫描");
 });

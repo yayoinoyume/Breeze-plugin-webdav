@@ -2,16 +2,18 @@
  * 分块 Range 下载。
  *
  * 宿主单次请求有 30 秒总超时，大文件必须切块（默认 8 MiB 一块）。
- * 服务器不支持 Range（回 200）时退化为整包 GET。
+ * 先探测总长度（HEAD，失败再 Range 0-0），拿不到就明确报错，绝不盲发整包 GET。
  */
 
 import { hostRequest } from "./host.ts";
 import type { HostRequest, HttpResponseData } from "./host.ts";
+import { redactUrl } from "../errors.ts";
 
 export const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
+export const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
 
 export type DownloadOptions = {
-  /** 已知文件长度时直接分块；不传则先发 HEAD 探测。 */
+  /** 已知文件长度时直接分块；不传则先 HEAD / Range 探测。 */
   contentLength?: number | null;
   /** 额外请求头（通常是 Basic 认证）。 */
   headers?: Record<string, string>;
@@ -25,7 +27,7 @@ export type DownloadResult = {
   bytes: Uint8Array;
   /** 最后一次成功的 HTTP 状态：200 表示整包，206 表示分块。 */
   status: number;
-  /** 实际发出的下载请求次数（HEAD 不计）。 */
+  /** 实际发出的下载请求次数（探测不计）。 */
   chunkCount: number;
   /** 是否真的用上了 Range。 */
   usedRange: boolean;
@@ -53,7 +55,9 @@ async function requestWithRetry(
       if (!isRetryableStatus(response.status)) {
         return response;
       }
-      lastError = new Error(`服务器返回 HTTP ${response.status}：${spec.method} ${spec.url}`);
+      lastError = new Error(
+        "服务器返回 HTTP " + response.status + "：" + spec.method + " " + redactUrl(spec.url)
+      );
     } catch (error) {
       lastError = error;
     }
@@ -64,14 +68,29 @@ async function requestWithRetry(
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
+function isAuthFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const text = error.message;
+  return (
+    text.includes("HTTP 401") ||
+    text.includes("HTTP 403") ||
+    text.includes("认证失败") ||
+    text.includes("网盘用户名")
+  );
+}
+
 function assertDownloadable(method: string, url: string, response: HttpResponseData): void {
   if (response.status === 401 || response.status === 403) {
     throw new Error(
-      "网盘用户名或密码不对（HTTP " + response.status + "）：" + method + " " + url
+      "网盘用户名或密码不对（HTTP " + response.status + "）：" + method + " " + redactUrl(url)
     );
   }
   if (response.status !== 200 && response.status !== 206) {
-    throw new Error("WebDAV 请求失败（HTTP " + response.status + "）：" + method + " " + url);
+    throw new Error(
+      "WebDAV 请求失败（HTTP " + response.status + "）：" + method + " " + redactUrl(url)
+    );
   }
 }
 
@@ -82,6 +101,27 @@ function parseContentLength(headers: Record<string, string>): number | null {
   }
   const value = Number.parseInt(String(raw).trim(), 10);
   return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+export type ContentRange = {
+  start: number;
+  end: number;
+  total: number | null;
+};
+
+/** 解析 Content-Range: bytes start-end/total（total 可能是 *）。 */
+export function parseContentRange(value: unknown): ContentRange | null {
+  const matched = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(String(value ?? "").trim());
+  if (matched === null) {
+    return null;
+  }
+  const start = Number.parseInt(matched[1], 10);
+  const end = Number.parseInt(matched[2], 10);
+  const total = matched[3] === "*" ? null : Number.parseInt(matched[3], 10);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end) {
+    return null;
+  }
+  return { start, end, total };
 }
 
 /** 用 HEAD 探测文件长度；服务器不支持 HEAD 时返回 null。 */
@@ -105,14 +145,81 @@ export async function headContentLength(
   }
 }
 
-function concatBytes(chunks: Uint8Array[], total: number): Uint8Array {
-  const output = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.length;
+/**
+ * 探测文件总长度：先 HEAD 的 Content-Length，失败再 GET Range 0-0 读 Content-Range。
+ * 两样都拿不到时返回 null（调用方必须报错，不能盲发整包 GET）。
+ */
+export async function probeContentLength(
+  url: string,
+  options: { headers?: Record<string, string>; request?: HostRequest } = {}
+): Promise<number | null> {
+  const request = options.request ?? hostRequest;
+  const headers = { ...(options.headers ?? {}) };
+
+  try {
+    const head = await request({ method: "HEAD", url, headers });
+    if (head.status === 401 || head.status === 403) {
+      assertDownloadable("HEAD", url, head);
+    }
+    if (head.status >= 200 && head.status < 300) {
+      const length = parseContentLength(head.headers);
+      if (length !== null) {
+        return length;
+      }
+    }
+  } catch (error) {
+    if (isAuthFailure(error)) {
+      throw error;
+    }
   }
-  return output;
+
+  try {
+    const probe = await request({
+      method: "GET",
+      url,
+      headers: { ...headers, Range: "bytes=0-0" }
+    });
+    if (probe.status === 401 || probe.status === 403) {
+      assertDownloadable("GET", url, probe);
+    }
+    if (probe.status === 206) {
+      const range = parseContentRange(probe.headers["content-range"]);
+      if (range !== null && range.start === 0 && range.end === 0 && range.total !== null) {
+        return range.total;
+      }
+      return null;
+    }
+    if (probe.status === 200) {
+      return parseContentLength(probe.headers);
+    }
+    if (probe.status === 416) {
+      const matched = /^bytes\s+\*\/(\d+)$/i.exec(
+        String(probe.headers["content-range"] ?? "").trim()
+      );
+      if (matched !== null) {
+        return Number.parseInt(matched[1], 10);
+      }
+    }
+  } catch (error) {
+    if (isAuthFailure(error)) {
+      throw error;
+    }
+  }
+  return null;
+}
+
+function assertWholeLength(bytes: Uint8Array, total: number, url: string): void {
+  if (bytes.length !== total) {
+    throw new Error(
+      "下载长度不一致：期望 " +
+        total +
+        " 字节，实际 " +
+        bytes.length +
+        " 字节（" +
+        redactUrl(url) +
+        "）"
+    );
+  }
 }
 
 /** 下载整段字节：长度已知且大于一块时按 Range 分块，否则整包 GET。 */
@@ -130,12 +237,30 @@ export async function downloadFileBytes(
 
   let total = typeof options.contentLength === "number" ? options.contentLength : null;
   if (total === null) {
-    total = await headContentLength(url, { headers, request });
+    total = await probeContentLength(url, { headers, request });
+  }
+  if (total === null) {
+    throw new Error(
+      "服务器不支持分块下载，也拿不到文件长度（HEAD 与 Range 探测都失败），已停止下载"
+    );
+  }
+  if (!Number.isFinite(total) || total < 0) {
+    throw new Error("服务器返回的文件长度不合法，已停止下载");
+  }
+  if (total > MAX_DOWNLOAD_BYTES) {
+    throw new Error(
+      "文件太大（" +
+        Math.ceil(total / (1024 * 1024)) +
+        " MiB），超过插件下载上限 " +
+        MAX_DOWNLOAD_BYTES / (1024 * 1024) +
+        " MiB"
+    );
   }
 
-  if (total === null || total <= 0 || total <= chunkSize) {
+  if (total <= chunkSize) {
     const response = await requestWithRetry(request, { method: "GET", url, headers }, retries);
     assertDownloadable("GET", url, response);
+    assertWholeLength(response.bytes, total, url);
     return {
       bytes: response.bytes,
       status: response.status,
@@ -144,7 +269,7 @@ export async function downloadFileBytes(
     };
   }
 
-  const parts: Uint8Array[] = [];
+  const output = new Uint8Array(total);
   let chunkCount = 0;
   let offset = 0;
 
@@ -155,7 +280,7 @@ export async function downloadFileBytes(
       {
         method: "GET",
         url,
-        headers: { ...headers, Range: `bytes=${offset}-${end}` }
+        headers: { ...headers, Range: "bytes=" + offset + "-" + end }
       },
       retries
     );
@@ -164,6 +289,7 @@ export async function downloadFileBytes(
 
     if (response.status === 200) {
       // 服务器忽略 Range，直接给整包。
+      assertWholeLength(response.bytes, total, url);
       return {
         bytes: response.bytes,
         status: 200,
@@ -172,18 +298,35 @@ export async function downloadFileBytes(
       };
     }
 
-    if (response.bytes.length === 0) {
-      throw new Error(`Range 响应为空：bytes=${offset}-${end}，${url}`);
+    const range = parseContentRange(response.headers["content-range"]);
+    if (
+      range === null ||
+      range.start !== offset ||
+      range.end !== end ||
+      range.total !== total
+    ) {
+      throw new Error(
+        "服务器返回的 Content-Range 与请求不一致（请求 bytes=" +
+          offset +
+          "-" +
+          end +
+          "），已停止分块下载"
+      );
     }
 
-    parts.push(response.bytes);
+    const expected = end - offset + 1;
+    if (response.bytes.length !== expected) {
+      throw new Error(
+        "服务器返回的块长度不一致：期望 " + expected + " 字节，实际 " + response.bytes.length + " 字节"
+      );
+    }
+    output.set(response.bytes, offset);
     offset += response.bytes.length;
   }
 
-  const bytes = concatBytes(parts, offset);
-  if (bytes.length !== total) {
-    throw new Error(`下载长度不一致：期望 ${total} 字节，实际 ${bytes.length} 字节（${url}）`);
+  if (offset !== total) {
+    throw new Error("下载长度不一致：期望 " + total + " 字节，实际 " + offset + " 字节");
   }
 
-  return { bytes, status: 206, chunkCount, usedRange: true };
+  return { bytes: output, status: 206, chunkCount, usedRange: true };
 }

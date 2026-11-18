@@ -32,8 +32,8 @@ import type { WebDavSettings } from "./settings.ts";
 import { createWebDavClient } from "./webdav/client.ts";
 import type { WebDavClient } from "./webdav/client.ts";
 import { downloadFileBytes } from "./http/download.ts";
-import { scanComics, sortImagePaths } from "./webdav/scan.ts";
-import type { ComicEntry } from "./webdav/scan.ts";
+import { scanComicsDetailed, sortImagePaths } from "./webdav/scan.ts";
+import type { ComicEntry, ScanResult } from "./webdav/scan.ts";
 import { decodeComicId, encodeComicId, encodePageUrl, parsePageUrl } from "./webdav/ids.ts";
 import type { ComicKind } from "./webdav/ids.ts";
 import { extractZipEntry, listZipImages, readZipEntries } from "./zip/cbz.ts";
@@ -49,6 +49,7 @@ export const SEARCH_PAGE_SIZE = 20;
 export const MAIN_CHAPTER_NAME = "全一话";
 
 const ZIP_CACHE_LIMIT = 2;
+const SCAN_CACHE_TTL_MS = 45 * 1000;
 
 type CachedZip = {
   path: string;
@@ -56,6 +57,16 @@ type CachedZip = {
 };
 
 const zipCache: CachedZip[] = [];
+const inflightZip = new Map<string, Promise<Uint8Array>>();
+
+type ScanCacheEntry = {
+  key: string;
+  expiresAt: number;
+  result: ScanResult;
+};
+
+let scanCache: ScanCacheEntry | null = null;
+let lastScanWarning: string | null = null;
 
 type ComicRef = {
   kind: ComicKind;
@@ -65,6 +76,18 @@ type ComicRef = {
 /** 清空模块内 CBZ 缓存（测试用）。 */
 export function clearZipCache(): void {
   zipCache.length = 0;
+  inflightZip.clear();
+}
+
+/** 清空扫描缓存（测试用）。 */
+export function clearScanCache(): void {
+  scanCache = null;
+  lastScanWarning = null;
+}
+
+/** 最近一次扫描的警告（达到列目录上限时非空）。 */
+export function getLastScanWarning(): string | null {
+  return lastScanWarning;
 }
 
 /** 当前缓存的 CBZ 路径（新的在前，测试用）。 */
@@ -112,17 +135,34 @@ export function clientForSettings(settings: WebDavSettings): WebDavClient {
   return createWebDavClient({
     baseUrl: settings.baseUrl,
     username: settings.username,
-    password: settings.password,
-    rootPath: settings.rootPath
+    password: settings.password
   });
 }
 
-/** 扫描当前设置下的全部漫画。 */
-export async function listComicEntries(
+function scanCacheKey(settings: WebDavSettings): string {
+  return [
+    settings.baseUrl,
+    settings.username,
+    settings.rootPath,
+    String(settings.scanDepth),
+    String(settings.maxComics),
+    settings.includeCbz ? "1" : "0"
+  ].join("|");
+}
+
+/** 扫描当前设置下的全部漫画；45 秒内翻页复用同一次扫描。 */
+export async function listComicEntriesDetailed(
   client: WebDavClient,
-  settings: WebDavSettings
-): Promise<ComicEntry[]> {
-  return scanComics(
+  settings: WebDavSettings,
+  options: { force?: boolean } = {}
+): Promise<ScanResult> {
+  const key = scanCacheKey(settings);
+  const now = Date.now();
+  if (!options.force && scanCache !== null && scanCache.key === key && scanCache.expiresAt > now) {
+    return scanCache.result;
+  }
+
+  const result = await scanComicsDetailed(
     {
       list: (input, depth) => client.list(input, depth),
       relativePath: (href) => client.relativePath(href)
@@ -134,6 +174,20 @@ export async function listComicEntries(
       includeCbz: settings.includeCbz
     }
   );
+  scanCache = { key, expiresAt: now + SCAN_CACHE_TTL_MS, result };
+  lastScanWarning = result.warning;
+  return result;
+}
+
+/** 扫描当前设置下的全部漫画；数组上附带 warning 字段。 */
+export async function listComicEntries(
+  client: WebDavClient,
+  settings: WebDavSettings
+): Promise<ComicEntry[]> {
+  const result = await listComicEntriesDetailed(client, settings);
+  const comics = result.comics as ComicEntry[] & { warning?: string | null };
+  comics.warning = result.warning;
+  return comics;
 }
 
 /** 按关键词过滤（只比标题，大小写不敏感）。 */
@@ -290,15 +344,30 @@ async function loadZipBytes(client: WebDavClient, path: string): Promise<Uint8Ar
     return cached.bytes;
   }
 
-  const result = await downloadFileBytes(client.urlFor(path), {
+  const pending = inflightZip.get(path);
+  if (pending !== undefined) {
+    return pending;
+  }
+
+  const task = downloadFileBytes(client.urlFor(path), {
     headers: client.authHeaders(),
     request: client.options.request
-  });
-  zipCache.unshift({ path, bytes: result.bytes });
-  if (zipCache.length > ZIP_CACHE_LIMIT) {
-    zipCache.pop();
-  }
-  return result.bytes;
+  }).then(
+    (result) => {
+      zipCache.unshift({ path, bytes: result.bytes });
+      if (zipCache.length > ZIP_CACHE_LIMIT) {
+        zipCache.pop();
+      }
+      inflightZip.delete(path);
+      return result.bytes;
+    },
+    (error) => {
+      inflightZip.delete(path);
+      throw error;
+    }
+  );
+  inflightZip.set(path, task);
+  return task;
 }
 
 /** 构造章节 + 页面。目录漫画列目录，CBZ 读中央目录。 */
@@ -333,7 +402,7 @@ export async function buildChapterWithPages(
 export function resolveComicRef(comicId: unknown, extern: unknown): ComicRef {
   const decoded = decodeComicId(asText(comicId));
   if (decoded !== null) {
-    return decoded;
+    return { kind: decoded.kind, path: normalizeDavPath(decoded.path) };
   }
   const map = asRecord(extern);
   const kind =
@@ -353,10 +422,12 @@ export async function fetchPageBytes(
 ): Promise<Uint8Array> {
   const map = asRecord(extern);
   const parsed = parsePageUrl(url ?? "");
-  const comicPath = asText(map.path) || (parsed === null ? "" : parsed.path);
-  if (comicPath === "") {
+  const rawComicPath = asText(map.path) || (parsed === null ? "" : parsed.path);
+  if (rawComicPath === "") {
     throw new Error("图片地址无效");
   }
+  const isAbsolute = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawComicPath);
+  const comicPath = isAbsolute ? rawComicPath : normalizeDavPath(rawComicPath);
   const declaredKind = asText(map.kind);
   const kind: ComicKind =
     declaredKind === "cbz" || declaredKind === "dir"
@@ -368,6 +439,9 @@ export async function fetchPageBytes(
 
   if (kind === "dir") {
     let imagePath = asText(map.imagePath);
+    if (imagePath !== "" && !/^[a-z][a-z0-9+.-]*:\/\//i.test(imagePath)) {
+      imagePath = normalizeDavPath(imagePath);
+    }
     if (imagePath === "") {
       const images = await listDirImages(client, comicPath);
       imagePath = images[index] ?? "";
@@ -398,6 +472,14 @@ function externOrNull(value: unknown): StringMap | null {
     : null;
 }
 
+function externWithWarning(value: unknown, warning: string | null): StringMap | null {
+  const extern = externOrNull(value);
+  if (warning === null) {
+    return extern;
+  }
+  return { ...(extern ?? {}), scanWarning: warning };
+}
+
 async function scanWithSettings(): Promise<{
   client: WebDavClient;
   settings: WebDavSettings;
@@ -412,7 +494,8 @@ export async function searchComic(
 ): Promise<SearchResultContract> {
   return withFriendlyErrors(async () => {
     const { client, settings } = await scanWithSettings();
-    const comics = filterComics(await listComicEntries(client, settings), payload.keyword ?? "");
+    const scan = await listComicEntriesDetailed(client, settings);
+    const comics = filterComics(scan.comics, payload.keyword ?? "");
     const slice = paginateComics(comics, Number(payload.page ?? 1), SEARCH_PAGE_SIZE);
     const paging = {
       page: slice.page,
@@ -423,7 +506,7 @@ export async function searchComic(
     const items = slice.items.map(buildListItem);
     return {
       source: PLUGIN_ID,
-      extern: externOrNull(payload.extern),
+      extern: externWithWarning(payload.extern, scan.warning),
       scheme: {
         version: "1.0.0",
         type: "searchResult",
@@ -443,11 +526,12 @@ export async function getComicList(
 ): Promise<ComicPagedListContract> {
   return withFriendlyErrors(async () => {
     const { client, settings } = await scanWithSettings();
-    const comics = filterComics(await listComicEntries(client, settings), payload.keyword ?? "");
+    const scan = await listComicEntriesDetailed(client, settings);
+    const comics = filterComics(scan.comics, payload.keyword ?? "");
     const slice = paginateComics(comics, Number(payload.page ?? 1), SEARCH_PAGE_SIZE);
     return {
       source: PLUGIN_ID,
-      extern: externOrNull(payload.extern),
+      extern: externWithWarning(payload.extern, scan.warning),
       scheme: { version: "1.0.0", type: "comicPagedList" },
       data: {
         items: slice.items.map(buildListItem),

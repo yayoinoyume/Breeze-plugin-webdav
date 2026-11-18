@@ -11,6 +11,17 @@ export const USER_MESSAGES = {
   unknown: "插件出错了，请稍后再试"
 } as const;
 
+/** 去掉 URL 里的 userinfo、查询串和片段，避免凭据进错误消息。 */
+export function redactUrl(value: unknown): string {
+  let text = String(value ?? "");
+  text = text.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, "$1");
+  const cut = text.search(/[?#]/);
+  if (cut >= 0) {
+    text = text.slice(0, cut) + "…";
+  }
+  return text;
+}
+
 /** 按错误内容归类成人话。 */
 export function friendlyMessage(error: unknown): string {
   const raw =

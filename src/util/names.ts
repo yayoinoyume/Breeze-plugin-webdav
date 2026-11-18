@@ -16,6 +16,15 @@ export function naturalCompare(a: string, b: string): number {
     const aIsNum = /^\d+$/.test(chunkA);
     const bIsNum = /^\d+$/.test(chunkB);
     if (aIsNum && bIsNum) {
+      const numA = Number.parseInt(chunkA, 10);
+      const numB = Number.parseInt(chunkB, 10);
+      if (Number.isSafeInteger(numA) && Number.isSafeInteger(numB)) {
+        if (numA !== numB) {
+          return numA - numB;
+        }
+        continue;
+      }
+      // 超长数字（超过安全整数）退化为去前导零后的长度/字典序比较。
       const strippedA = chunkA.replace(/^0+/, "") || "0";
       const strippedB = chunkB.replace(/^0+/, "") || "0";
       if (strippedA.length !== strippedB.length) {
@@ -23,9 +32,6 @@ export function naturalCompare(a: string, b: string): number {
       }
       if (strippedA !== strippedB) {
         return strippedA < strippedB ? -1 : 1;
-      }
-      if (chunkA.length !== chunkB.length) {
-        return chunkA.length - chunkB.length;
       }
       continue;
     }
@@ -37,7 +43,7 @@ export function naturalCompare(a: string, b: string): number {
     if (lowerA !== lowerB) {
       return lowerA < lowerB ? -1 : 1;
     }
-    return chunkA < chunkB ? -1 : 1;
+    continue;
   }
   return chunksA.length - chunksB.length;
 }
@@ -77,6 +83,9 @@ export function normalizeDavPath(path: string): string {
   value = value.replace(/\/{2,}/g, "/");
   if (value.length > 1) {
     value = value.replace(/\/+$/, "");
+  }
+  if (value.split("/").some((segment) => segment === "..")) {
+    throw new Error("路径里不能包含 ..（上级目录）");
   }
   return value === "" ? "/" : value;
 }

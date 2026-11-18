@@ -32,7 +32,7 @@ test("chunked-download 分块拼接，并在服务器忽略 Range 时回退整�
       status: 206,
       statusText: "Partial Content",
       url: spec.url,
-      headers: {},
+      headers: { "content-range": "bytes " + start + "-" + end + "/" + payload.length },
       bytes: payload.slice(start, end + 1)
     };
   };

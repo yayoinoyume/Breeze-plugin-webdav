@@ -1,8 +1,8 @@
 /**
  * 端到端测试：加载编译后的 .bundle.cjs，注入最小 Breeze 宿主 shim，
- * 对本地测试 WebDAV 服务器跑两条完整链路：目录漫画 + CBZ 漫画。
+ * 对本地测试 WebDAV 服务器跑两组完整链路：rootPath=/ 与 rootPath=/comics。
  *
- * 最后一行固定输出 E2E PASS dir=<sha8> cbz=<sha8> ...
+ * 最后一行固定输出 E2E PASS，并分别带两组 dir=/cbz= 的 sha256 前 8 位。
  */
 
 import "breeze-plugin-kit/node";
@@ -123,15 +123,18 @@ function assertEqual(actual, expected, message) {
   }
 }
 
-async function saveSettings(mod, baseUrl) {
+async function saveSettings(mod, baseUrl, rootPath) {
   const keys = mod.SETTING_KEYS;
   await authConfig.save(keys.baseUrl, baseUrl);
   await authConfig.save(keys.username, AUTH_USER);
   await authConfig.save(keys.password, AUTH_PASS);
-  await authConfig.save(keys.rootPath, "/");
+  await authConfig.save(keys.rootPath, rootPath);
   await authConfig.save(keys.scanDepth, "2");
   await authConfig.save(keys.maxComics, "300");
   await authConfig.save(keys.includeCbz, "true");
+  if (typeof mod.clearScanCache === "function") {
+    mod.clearScanCache();
+  }
 }
 
 async function fetchAndHash(mod, page) {
@@ -140,13 +143,15 @@ async function fetchAndHash(mod, page) {
   return { bytes, hash: sha256(bytes) };
 }
 
-async function runDirChain(mod, server, searchItems) {
-  const item = searchItems.find((entry) => entry.extern && entry.extern.kind === "dir");
-  check(item !== undefined, "搜索结果里没有目录漫画");
-  assertEqual(item.extern.path, "/", "目录漫画路径");
+async function runDirChain(mod, server, searchItems, expectedPath) {
+  const item = searchItems.find(
+    (entry) => entry.extern && entry.extern.kind === "dir" && entry.extern.path === expectedPath
+  );
+  check(item !== undefined, "搜索结果里没有目录漫画：" + expectedPath);
 
   const detail = await mod.getComicDetail({ comicId: item.id });
-  assertEqual(detail.data.normal.comicInfo.title, "漫画库", "目录漫画标题");
+  const expectedTitle = expectedPath === "/" ? "漫画库" : expectedPath.split("/").pop();
+  assertEqual(detail.data.normal.comicInfo.title, expectedTitle, "目录漫画标题");
   assertEqual(detail.data.normal.eps.length, 1, "目录漫画章节数");
 
   const snapshot = await mod.getReadSnapshot({ comicId: item.id, chapterId: item.id });
@@ -172,13 +177,18 @@ async function runDirChain(mod, server, searchItems) {
   return hashes[0];
 }
 
-async function runCbzChain(mod, server, searchItems) {
-  const item = searchItems.find((entry) => entry.extern && entry.extern.kind === "cbz");
-  check(item !== undefined, "搜索结果里没有 CBZ 漫画");
-  assertEqual(item.extern.path, "/合集.cbz", "CBZ 路径");
+async function runCbzChain(mod, server, searchItems, expectedPath, zipBytes) {
+  const item = searchItems.find(
+    (entry) => entry.extern && entry.extern.kind === "cbz" && entry.extern.path === expectedPath
+  );
+  check(item !== undefined, "搜索结果里没有 CBZ 漫画：" + expectedPath);
 
   const detail = await mod.getComicDetail({ comicId: item.id });
-  assertEqual(detail.data.normal.comicInfo.title, "合集", "CBZ 标题");
+  assertEqual(
+    detail.data.normal.comicInfo.title,
+    expectedPath.split("/").pop().replace(/\.(cbz|zip)$/i, ""),
+    "CBZ 标题"
+  );
   assertEqual(detail.data.normal.comicInfo.cover.extern.kind, "cbz", "CBZ 封面类型");
 
   const snapshot = await mod.getReadSnapshot({ comicId: item.id, chapterId: item.id });
@@ -187,7 +197,7 @@ async function runCbzChain(mod, server, searchItems) {
   const chapter = await mod.getChapter({ comicId: item.id, chapterId: item.id });
   assertEqual(chapter.data.chapter.pages.length, 3, "getChapter CBZ 页数");
 
-  const expectedEntries = unzipSync(server.fixture.cbz);
+  const expectedEntries = unzipSync(zipBytes);
   const hashes = [];
   for (const page of snapshot.data.chapter.pages) {
     const expected = expectedEntries[page.path];
@@ -201,6 +211,24 @@ async function runCbzChain(mod, server, searchItems) {
   const cover = await fetchAndHash(mod, detail.data.normal.comicInfo.cover);
   assertEqual(cover.hash, hashes[0], "CBZ 封面应等于第一页");
   return hashes[0];
+}
+
+async function runGroup(mod, server, baseUrl, rootPath, expectedDirPath, expectedCbzPath, zipBytes) {
+  await saveSettings(mod, baseUrl, rootPath);
+  const search = await mod.searchComic({});
+  check(search.items.length >= 2, "搜索结果至少应包含目录漫画与 CBZ");
+  const titles = search.items.map((item) => item.title).join(",");
+  console.error("[e2e] " + rootPath + " 搜索结果：" + titles);
+
+  const dirSha = await runDirChain(mod, server, search.items, expectedDirPath);
+  const cbzSha = await runCbzChain(mod, server, search.items, expectedCbzPath, zipBytes);
+
+  const listPage = await mod.getComicList({ page: 1 });
+  check(listPage.data.items.length >= 2, "getComicList 列表为空");
+  console.error(
+    "[e2e] " + rootPath + " dir=" + dirSha.slice(0, 8) + " cbz=" + cbzSha.slice(0, 8)
+  );
+  return { dirSha, cbzSha };
 }
 
 async function main() {
@@ -219,7 +247,8 @@ async function main() {
       "getComicDetail",
       "getReadSnapshot",
       "getChapter",
-      "fetchImageBytes"
+      "fetchImageBytes",
+      "clearScanCache"
     ]) {
       if (typeof mod[name] !== "function") {
         throw new Error("bundle 没有导出 " + name);
@@ -235,7 +264,7 @@ async function main() {
       password: AUTH_PASS
     });
     const rootEntries = await client.list("/", 1);
-    assertEqual(rootEntries.length, 5, "根目录条目数");
+    assertEqual(rootEntries.length, 6, "根目录条目数");
     const cbzEntry = rootEntries.find((entry) => entry.href.endsWith(".cbz"));
     check(cbzEntry !== undefined, "根目录没有找到 cbz");
     assertEqual(cbzEntry.contentLength, server.fixture.cbz.length, "cbz 的 getcontentlength");
@@ -251,25 +280,38 @@ async function main() {
     assertEqual(download.usedRange, true, "cbz 是否使用 Range");
     assertEqual(sha256(download.bytes), sha256(server.fixture.cbz), "cbz 整包 sha256");
 
-    // 1. 插件链路：设置 → 搜索
-    await saveSettings(mod, baseUrl);
-    const search = await mod.searchComic({});
-    check(search.items.length >= 2, "搜索结果至少应包含目录漫画与 CBZ");
-    const titles = search.items.map((item) => item.title).join(",");
-    console.error("[e2e] 搜索结果：" + titles);
+    // 1. rootPath=/ 的完整链路
+    const rootGroup = await runGroup(
+      mod,
+      server,
+      baseUrl,
+      "/",
+      "/",
+      "/合集.cbz",
+      server.fixture.cbz
+    );
 
-    const dirSha = await runDirChain(mod, server, search.items);
-    const cbzSha = await runCbzChain(mod, server, search.items);
-
-    const listPage = await mod.getComicList({ page: 1 });
-    check(listPage.data.items.length >= 2, "getComicList 列表为空");
+    // 2. rootPath=/comics 的完整链路（验证不会再拼一次 rootPath）
+    const comicsGroup = await runGroup(
+      mod,
+      server,
+      baseUrl,
+      "/comics",
+      "/comics/目录漫画",
+      "/comics/整包.cbz",
+      server.fixture.comicsCbz
+    );
 
     console.log(
-      "E2E PASS dir=" +
-        dirSha.slice(0, 8) +
+      "E2E PASS rootPath=/ dir=" +
+        rootGroup.dirSha.slice(0, 8) +
         " cbz=" +
-        cbzSha.slice(0, 8) +
-        " dirPages=3 cbzPages=3 cbzBytes=" +
+        rootGroup.cbzSha.slice(0, 8) +
+        " rootPath=/comics dir=" +
+        comicsGroup.dirSha.slice(0, 8) +
+        " cbz=" +
+        comicsGroup.cbzSha.slice(0, 8) +
+        " cbzBytes=" +
         download.bytes.length +
         " chunks=" +
         download.chunkCount

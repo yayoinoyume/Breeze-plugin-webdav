@@ -42,6 +42,13 @@ import { decodeComicId, encodeComicId, encodePageUrl, parsePageUrl } from "./web
 import type { ComicKind } from "./webdav/ids.ts";
 import { extractZipEntry, listZipImages, readZipEntries } from "./zip/cbz.ts";
 import type { ZipEntry } from "./zip/cbz.ts";
+import {
+  openRemoteZip,
+  readRemoteZipEntry,
+  RemoteZipRangeUnsupportedError
+} from "./zip/remote-zip.ts";
+import type { RemoteZipInfo, RemoteZipSource } from "./zip/remote-zip.ts";
+import { hostRequest } from "./http/host.ts";
 import type { DavEntry } from "./webdav/xml.ts";
 import {
   baseName,
@@ -68,6 +75,22 @@ type CachedZip = {
 const zipCache: CachedZip[] = [];
 const inflightZip = new Map<string, Promise<Uint8Array>>();
 
+/** 中央目录缓存上限：每个包几十 KB，只缓存小索引，不缓存整包。 */
+const REMOTE_ZIP_CACHE_LIMIT = 16;
+const REMOTE_ZIP_DIAGNOSTIC_LIMIT = 20;
+
+type CachedRemoteZip = {
+  key: string;
+  path: string;
+  info: RemoteZipInfo;
+};
+
+const remoteZipCache: CachedRemoteZip[] = [];
+const inflightRemoteZip = new Map<string, Promise<RemoteZipInfo>>();
+/** 判定过「服务器不支持 Range」的包：之后的取页直接走整包，不再重复试错。 */
+const remoteZipFallbackKeys = new Set<string>();
+const remoteZipDiagnostics: string[] = [];
+
 type ScanCacheEntry = {
   key: string;
   expiresAt: number;
@@ -87,6 +110,24 @@ export function clearZipCache(): void {
   zipCache.length = 0;
   inflightZip.clear();
   zipCacheBudget = ZIP_CACHE_BUDGET_BYTES;
+  clearRemoteZipCache();
+}
+
+/** 清空远程 CBZ 的中央目录缓存与「不支持 Range」判定（测试用）。 */
+export function clearRemoteZipCache(): void {
+  remoteZipCache.length = 0;
+  inflightRemoteZip.clear();
+  remoteZipFallbackKeys.clear();
+}
+
+/** 远程取页的回退诊断（回退过一次就有一条，按包去重）。 */
+export function getRemoteZipDiagnostics(): string[] {
+  return remoteZipDiagnostics.slice();
+}
+
+/** 清空远程取页诊断（测试用）。 */
+export function clearRemoteZipDiagnostics(): void {
+  remoteZipDiagnostics.length = 0;
 }
 
 /** 调整 CBZ 缓存预算（测试用）；传 null 恢复默认。 */
@@ -486,6 +527,160 @@ async function loadZipBytes(client: WebDavClient, path: string): Promise<Uint8Ar
   return task;
 }
 
+function remoteZipSource(client: WebDavClient, path: string): RemoteZipSource {
+  return {
+    url: client.urlFor(path),
+    headers: client.authHeaders(),
+    request: client.options.request ?? hostRequest
+  };
+}
+
+/** 记一次回退诊断（同一个包只记一次），并标记该包以后直接走整包。 */
+function rememberRemoteZipFallback(client: WebDavClient, path: string, reason: string): void {
+  const key = zipCacheKey(client, path);
+  remoteZipFallbackKeys.add(key);
+  if (remoteZipDiagnostics.some((item) => item.indexOf(key) >= 0)) {
+    return;
+  }
+  const text = "CBZ 远程取页不可用，已回退整包下载（" + path + "）：" + reason;
+  remoteZipDiagnostics.push(text);
+  if (remoteZipDiagnostics.length > REMOTE_ZIP_DIAGNOSTIC_LIMIT) {
+    remoteZipDiagnostics.shift();
+  }
+  if (typeof console !== "undefined" && typeof console.warn === "function") {
+    console.warn("[webdav] " + text);
+  }
+}
+
+/** 回退时如果服务器已经顺带返回了整包，直接塞进 LRU，避免再下载一次。 */
+function seedZipCache(client: WebDavClient, path: string, bytes: Uint8Array): void {
+  const key = zipCacheKey(client, path);
+  const hit = zipCache.findIndex((entry) => entry.key === key);
+  if (hit >= 0) {
+    zipCache.splice(hit, 1);
+  }
+  zipCache.unshift({ key, path, bytes });
+  trimZipCache();
+}
+
+/** 打开远程包的中央目录；不支持 Range 时返回 null（回退由调用方完成）。 */
+async function tryOpenRemoteZip(
+  client: WebDavClient,
+  path: string
+): Promise<RemoteZipInfo | null> {
+  const key = zipCacheKey(client, path);
+  if (remoteZipFallbackKeys.has(key)) {
+    return null;
+  }
+  const hit = remoteZipCache.findIndex((entry) => entry.key === key);
+  if (hit >= 0) {
+    const cached = remoteZipCache.splice(hit, 1)[0];
+    remoteZipCache.unshift(cached);
+    return cached.info;
+  }
+  const pending = inflightRemoteZip.get(key);
+  if (pending !== undefined) {
+    try {
+      return await pending;
+    } catch (error) {
+      if (error instanceof RemoteZipRangeUnsupportedError) {
+        rememberRemoteZipFallback(client, path, error.message);
+        if (error.fullBytes !== null) {
+          seedZipCache(client, path, error.fullBytes);
+        }
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  const task = openRemoteZip(remoteZipSource(client, path)).then(
+    (info) => {
+      remoteZipCache.unshift({ key, path, info });
+      while (remoteZipCache.length > REMOTE_ZIP_CACHE_LIMIT) {
+        remoteZipCache.pop();
+      }
+      inflightRemoteZip.delete(key);
+      return info;
+    },
+    (error) => {
+      inflightRemoteZip.delete(key);
+      throw error;
+    }
+  );
+  inflightRemoteZip.set(key, task);
+
+  try {
+    return await task;
+  } catch (error) {
+    if (error instanceof RemoteZipRangeUnsupportedError) {
+      rememberRemoteZipFallback(client, path, error.message);
+      if (error.fullBytes !== null) {
+        seedZipCache(client, path, error.fullBytes);
+      }
+      return null;
+    }
+    throw error;
+  }
+}
+
+/** CBZ 的图片条目：优先读远程中央目录，服务器不支持 Range 时整包兜底。 */
+async function loadZipImageEntries(
+  client: WebDavClient,
+  path: string
+): Promise<ZipEntry[]> {
+  const remote = await tryOpenRemoteZip(client, path);
+  if (remote !== null) {
+    return listZipImages(remote.entries);
+  }
+  const bytes = await loadZipBytes(client, path);
+  return listZipImages(readZipEntries(bytes));
+}
+
+function pickZipEntry(
+  images: ZipEntry[],
+  entryName: string,
+  index: number
+): ZipEntry | undefined {
+  return entryName === ""
+    ? images[index]
+    : images.find((candidate) => candidate.name === entryName);
+}
+
+/** 取 CBZ 的一页：远程只拉这一页；Range 不可用时回退整包解压。 */
+async function fetchZipPageBytes(
+  client: WebDavClient,
+  path: string,
+  entryName: string,
+  index: number
+): Promise<Uint8Array> {
+  const remote = await tryOpenRemoteZip(client, path);
+  if (remote !== null) {
+    const entry = pickZipEntry(listZipImages(remote.entries), entryName, index);
+    if (entry === undefined) {
+      throw new Error("CBZ 里找不到这一页");
+    }
+    try {
+      return await readRemoteZipEntry(remoteZipSource(client, path), remote.totalSize, entry);
+    } catch (error) {
+      if (!(error instanceof RemoteZipRangeUnsupportedError)) {
+        throw error;
+      }
+      rememberRemoteZipFallback(client, path, error.message);
+      if (error.fullBytes !== null) {
+        seedZipCache(client, path, error.fullBytes);
+      }
+    }
+  }
+
+  const bytes = await loadZipBytes(client, path);
+  const entry = pickZipEntry(listZipImages(readZipEntries(bytes)), entryName, index);
+  if (entry === undefined) {
+    throw new Error("CBZ 里找不到这一页");
+  }
+  return extractZipEntry(bytes, entry);
+}
+
 type ChapterWithPagesResult = {
   chapter: ChapterWithPages;
   /** 列目录时被跳过的脏图片数（用于冷启动也能给出 warning）。 */
@@ -516,8 +711,7 @@ export async function buildChapterWithPagesDetailed(
     };
   }
 
-  const bytes = await loadZipBytes(client, comic.path);
-  const images = listZipImages(readZipEntries(bytes));
+  const images = await loadZipImageEntries(client, comic.path);
   if (images.length === 0) {
     throw new Error("CBZ 里没有图片");
   }
@@ -607,17 +801,7 @@ export async function fetchPageBytes(
     return response.bytes;
   }
 
-  const bytes = await loadZipBytes(client, comicPath);
-  const images = listZipImages(readZipEntries(bytes));
-  const entryName = asText(map.entry);
-  const entry =
-    entryName === ""
-      ? images[index]
-      : images.find((candidate) => candidate.name === entryName);
-  if (entry === undefined) {
-    throw new Error("CBZ 里找不到这一页");
-  }
-  return extractZipEntry(bytes, entry);
+  return fetchZipPageBytes(client, comicPath, asText(map.entry), index);
 }
 
 function externOrNull(value: unknown): StringMap | null {

@@ -232,7 +232,7 @@ async function runGroup(mod, server, baseUrl, rootPath, expectedDirPath, expecte
 }
 
 async function main() {
-  const server = await startWebDavServer({ user: AUTH_USER, pass: AUTH_PASS });
+  const server = await startWebDavServer({ user: AUTH_USER, pass: AUTH_PASS, bigCbz: true });
   try {
     installHostShim();
 
@@ -264,7 +264,7 @@ async function main() {
       password: AUTH_PASS
     });
     const rootEntries = await client.list("/", 1);
-    assertEqual(rootEntries.length, 6, "根目录条目数");
+    assertEqual(rootEntries.length, 7, "根目录条目数");
     const cbzEntry = rootEntries.find((entry) => entry.href.endsWith(".cbz"));
     check(cbzEntry !== undefined, "根目录没有找到 cbz");
     assertEqual(cbzEntry.contentLength, server.fixture.cbz.length, "cbz 的 getcontentlength");
@@ -300,6 +300,36 @@ async function main() {
       "/comics/目录漫画",
       "/comics/整包.cbz",
       server.fixture.comicsCbz
+    );
+
+    // 3. CBZ 首屏字节：50 MiB+ 的包只拉第一页，不整包下载。
+    await saveSettings(mod, baseUrl, "/");
+    const bigSearch = await mod.searchComic({});
+    const bigItem = bigSearch.items.find((item) => item.extern && item.extern.path === "/大包.cbz");
+    check(bigItem !== undefined, "搜索结果里没有 /大包.cbz");
+    const mark = server.requests.length;
+    const bigSnapshot = await mod.getReadSnapshot({ comicId: bigItem.id, chapterId: bigItem.id });
+    check(bigSnapshot.data.chapter.pages.length >= 100, "大包应有至少 100 页");
+    const bigFirst = bigSnapshot.data.chapter.pages[0];
+    const firstPageBytes = await mod.fetchImageBytes({ url: bigFirst.url, extern: bigFirst.extern });
+    check(firstPageBytes instanceof Uint8Array && firstPageBytes.length > 0, "大包第一页应有字节");
+    const firstScreenBytes = server.requests
+      .slice(mark)
+      .reduce((sum, record) => sum + record.responseBytes, 0);
+    const packageBytes = server.fixture.bigCbz.length;
+    const ratio = firstScreenBytes / packageBytes;
+    check(
+      ratio < 0.05,
+      "CBZ 首屏下载应小于包大小 5%，实际 " + firstScreenBytes + " / " + packageBytes
+    );
+    console.error(
+      "[e2e] CBZ 首屏下载字节 packageBytes=" +
+        packageBytes +
+        " firstScreenBytes=" +
+        firstScreenBytes +
+        " ratio=" +
+        (ratio * 100).toFixed(2) +
+        "%"
     );
 
     console.log(

@@ -3,6 +3,11 @@
  *
  * 支持：Basic 认证、PROPFIND(Depth 0/1/infinity)、GET、HEAD、Range(206)。
  * fixture 每次启动重新生成，内容确定但不必与任何外部文件一致。
+ *
+ * 额外开关（给 CBZ 远程取页测试用）：
+ * - bigCbz: true     根目录放一个 ≥50 MiB、120 页的 CBZ（stored 与 deflate 混合）
+ * - edgeCbz: true    放三个边界包：注释 65535 B、ZIP64、CRC 被篡改
+ * - ignoreRange: true 服务器忽略 Range，GET 一律返回 200 整包
  */
 
 import { createServer } from "node:http";
@@ -33,6 +38,83 @@ function makePngLike(size, seed) {
   }
   bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
   return bytes;
+}
+
+/** 按条目指定压缩级别（level 0 = stored，6 = deflate）。 */
+function buildMixedZip(files) {
+  const zippable = {};
+  for (const [name, bytes, level] of files) {
+    zippable[name] = [bytes, { level }];
+  }
+  return zipSync(zippable, { level: 0 });
+}
+
+function readU32(bytes, offset) {
+  return (
+    (bytes[offset] |
+      (bytes[offset + 1] << 8) |
+      (bytes[offset + 2] << 16) |
+      (bytes[offset + 3] << 24)) >>>
+    0
+  );
+}
+
+function writeU16(bytes, offset, value) {
+  bytes[offset] = value & 0xff;
+  bytes[offset + 1] = (value >>> 8) & 0xff;
+}
+
+function writeU32(bytes, offset, value) {
+  bytes[offset] = value & 0xff;
+  bytes[offset + 1] = (value >>> 8) & 0xff;
+  bytes[offset + 2] = (value >>> 16) & 0xff;
+  bytes[offset + 3] = (value >>> 24) & 0xff;
+}
+
+function findEocd(bytes) {
+  for (let offset = bytes.length - 22; offset >= 0; offset -= 1) {
+    if (readU32(bytes, offset) === 0x06054b50) {
+      return offset;
+    }
+  }
+  throw new Error("测试 ZIP 里找不到 EOCD");
+}
+
+/** 给归档加一条超长注释（ZIP 规范上限 65535 字节）。 */
+function withZipComment(zip, commentLength) {
+  const eocd = findEocd(zip);
+  const out = new Uint8Array(eocd + 22 + commentLength);
+  out.set(zip.subarray(0, eocd + 22), 0);
+  writeU16(out, eocd + 20, commentLength);
+  out.fill(0x20, eocd + 22);
+  return out;
+}
+
+/** 把 EOCD 的中央目录偏移改成 ZIP64 哨兵值。 */
+function asZip64Sentinel(zip) {
+  const out = zip.slice();
+  const eocd = findEocd(out);
+  writeU32(out, eocd + 16, 0xffffffff);
+  return out;
+}
+
+/** 篡改中央目录里某条目的 CRC（数据本身不变，解压后 CRC 必然对不上）。 */
+function withBrokenCrc(zip, entryName) {
+  const out = zip.slice();
+  for (let offset = 0; offset + 46 <= out.length; offset += 1) {
+    if (readU32(out, offset) !== 0x02014b50) {
+      continue;
+    }
+    const nameLength = out[offset + 28] | (out[offset + 29] << 8);
+    const nameBytes = out.subarray(offset + 46, offset + 46 + nameLength);
+    const name = new TextDecoder("utf-8").decode(nameBytes);
+    if (name === entryName) {
+      const crc = readU32(out, offset + 16);
+      writeU32(out, offset + 16, (crc ^ 0xffffffff) >>> 0);
+      return out;
+    }
+  }
+  throw new Error("测试 ZIP 里找不到条目：" + entryName);
 }
 
 function dir(children) {
@@ -105,7 +187,46 @@ export function createFixture(options = {}) {
     // 合法但带 % 的名字：根目录放 100%.png（解码文本里是字面 %）。
     rootChildren["100%.png"] = file(makePngLike(9 * 1024, 64));
   }
+
+  // 大包：120 页 × 448 KiB ≈ 52.5 MiB，偶数页 deflate、奇数页 stored。
+  let bigCbz = null;
+  const bigCbzEntries = new Map();
+  if (options.bigCbz === true) {
+    const files = [];
+    for (let index = 1; index <= 120; index += 1) {
+      const name = String(index).padStart(3, "0") + ".png";
+      const payload = makePngLike(448 * 1024, 5000 + index);
+      files.push([name, payload, index % 2 === 0 ? 0 : 6]);
+      bigCbzEntries.set(name, payload);
+    }
+    bigCbz = buildMixedZip(files);
+    rootChildren["大包.cbz"] = file(bigCbz);
+  }
+
+  // 边界包：超长注释 / ZIP64 / CRC 被篡改。
+  let edgeCbz = null;
+  if (options.edgeCbz === true) {
+    const edgeFiles = new Map([
+      ["001.png", makePngLike(64 * 1024, 900)],
+      ["002.png", makePngLike(64 * 1024, 901)]
+    ]);
+    const base = buildMixedZip([
+      ["001.png", edgeFiles.get("001.png"), 0],
+      ["002.png", edgeFiles.get("002.png"), 6]
+    ]);
+    edgeCbz = {
+      commentTooLarge: withZipComment(base, 65535),
+      zip64: asZip64Sentinel(base),
+      crcMismatch: withBrokenCrc(base, "001.png"),
+      entries: edgeFiles
+    };
+    rootChildren["长注释.cbz"] = file(edgeCbz.commentTooLarge);
+    rootChildren["zip64.cbz"] = file(edgeCbz.zip64);
+    rootChildren["坏CRC.cbz"] = file(edgeCbz.crcMismatch);
+  }
+
   const root = dir(rootChildren);
+
   // 脏名字条目：href 里会出现 %252e%252e / %5C / %255C 这些形式。
   const dirtyEntries = Array.isArray(options.dirtyEntries) ? options.dirtyEntries : [];
   if (dirtyEntries.length > 0) {
@@ -144,21 +265,26 @@ export function createFixture(options = {}) {
   const files = new Map();
   const walk = (node, relative) => {
     if (node.type === "file") {
-      files.set(`${DAV_PREFIX}${relative === "/" ? "/" : relative}`, node.bytes);
+      files.set(toDavKey(relative), node.bytes);
       return;
     }
     for (const [name, child] of node.children) {
-      walk(child, relative === "/" ? `/${name}` : `${relative}/${name}`);
+      walk(child, relative === "/" ? "/" + name : relative + "/" + name);
     }
   };
   walk(root, "/");
 
-  return { root, files, cbz, comicsCbz };
+  return { root, files, cbz, comicsCbz, bigCbz, bigCbzEntries, edgeCbz };
+}
+
+/** 与旧实现一致的路径拼接（避免重复斜杠）。 */
+function toDavKey(relative) {
+  return DAV_PREFIX + (relative === "/" ? "/" : relative);
 }
 
 function isAuthorized(req, user, pass) {
   const header = req.headers.authorization ?? "";
-  const expected = `Basic ${Buffer.from(`${user}:${pass}`, "utf8").toString("base64")}`;
+  const expected = "Basic " + Buffer.from(user + ":" + pass, "utf8").toString("base64");
   return header === expected;
 }
 
@@ -184,8 +310,8 @@ function encodeHref(relativePath, isCollection) {
     .filter((segment) => segment !== "")
     .map((segment) => encodeURIComponent(segment))
     .join("/");
-  const href = encoded === "" ? `${DAV_PREFIX}/` : `${DAV_PREFIX}/${encoded}`;
-  return isCollection && !href.endsWith("/") ? `${href}/` : href;
+  const href = encoded === "" ? DAV_PREFIX + "/" : DAV_PREFIX + "/" + encoded;
+  return isCollection && !href.endsWith("/") ? href + "/" : href;
 }
 
 function escapeXml(text) {
@@ -205,12 +331,12 @@ function propfindResponseXml(relativePath, node, depth, extraHrefs = []) {
     const name = path.split("/").filter((segment) => segment !== "").pop() ?? "";
     items.push(
       "<D:response>" +
-        `<D:href>${escapeXml(encodeHref(path, isCollection))}</D:href>` +
+        "<D:href>" + escapeXml(encodeHref(path, isCollection)) + "</D:href>" +
         "<D:propstat><D:prop>" +
-        `<D:displayname>${escapeXml(name)}</D:displayname>` +
-        `<D:resourcetype>${isCollection ? "<D:collection/>" : ""}</D:resourcetype>` +
-        `<D:getcontentlength>${size}</D:getcontentlength>` +
-        `<D:getlastmodified>${LAST_MODIFIED}</D:getlastmodified>` +
+        "<D:displayname>" + escapeXml(name) + "</D:displayname>" +
+        "<D:resourcetype>" + (isCollection ? "<D:collection/>" : "") + "</D:resourcetype>" +
+        "<D:getcontentlength>" + size + "</D:getcontentlength>" +
+        "<D:getlastmodified>" + LAST_MODIFIED + "</D:getlastmodified>" +
         "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>" +
         "</D:response>"
     );
@@ -222,7 +348,7 @@ function propfindResponseXml(relativePath, node, depth, extraHrefs = []) {
       return;
     }
     for (const [name, child] of current.children) {
-      walk(path === "/" ? `/${name}` : `${path}/${name}`, child, remainingDepth - 1);
+      walk(path === "/" ? "/" + name : path + "/" + name, child, remainingDepth - 1);
     }
   };
 
@@ -284,6 +410,7 @@ function contentTypeOf(path) {
 
 /**
  * 启动测试服务器，返回 { port, fixture, requests, close }。
+ * requests 里每条记录都带 responseBytes（本次响应真正发出的字节数，HEAD 为 0）。
  */
 export async function startWebDavServer(options = {}) {
   const user = options.user ?? AUTH_USER;
@@ -293,10 +420,13 @@ export async function startWebDavServer(options = {}) {
     dirtyEntries: Array.isArray(options.dirtyEntries) ? options.dirtyEntries : [],
     percentNames: options.percentNames === true,
     emptyDirs: Array.isArray(options.emptyDirs) ? options.emptyDirs : [],
-    trailingSpaceName: options.trailingSpaceName === true
+    trailingSpaceName: options.trailingSpaceName === true,
+    bigCbz: options.bigCbz === true,
+    edgeCbz: options.edgeCbz === true
   });
   const extraHrefs = Array.isArray(options.extraHrefs) ? options.extraHrefs : [];
   const forbiddenPaths = Array.isArray(options.forbiddenPaths) ? options.forbiddenPaths : [];
+  const ignoreRange = options.ignoreRange === true;
   const requests = [];
 
   const server = createServer((req, res) => {
@@ -309,51 +439,47 @@ export async function startWebDavServer(options = {}) {
     } catch {
       path = url.pathname;
     }
-    requests.push({
+    const record = {
       method: req.method ?? "",
       path,
       range: req.headers.range ?? null,
-      depth: req.headers.depth ?? null
-    });
+      depth: req.headers.depth ?? null,
+      responseBytes: 0
+    };
+    requests.push(record);
+
+    const reply = (status, headers, body, byteLength) => {
+      record.responseBytes = byteLength ?? (body === undefined ? 0 : Buffer.byteLength(body));
+      res.writeHead(status, headers);
+      res.end(body);
+    };
+    const replyText = (status, text, headers = {}) =>
+      reply(status, { "Content-Type": "text/plain; charset=utf-8", ...headers }, text);
 
     if (!isAuthorized(req, user, pass)) {
-      res.writeHead(401, {
-        "Content-Type": "text/plain; charset=utf-8",
-        "WWW-Authenticate": 'Basic realm="webdav-test"'
-      });
-      res.end("unauthorized");
+      replyText(401, "unauthorized", { "WWW-Authenticate": 'Basic realm="webdav-test"' });
       return;
     }
 
-    if (
-      forbiddenPaths.some(
-        (prefix) => path === prefix || path.startsWith(prefix + "/")
-      )
-    ) {
-      res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("forbidden");
+    if (forbiddenPaths.some((prefix) => path === prefix || path.startsWith(prefix + "/"))) {
+      replyText(403, "forbidden");
       return;
     }
 
     let relativePath = null;
-    if (path === DAV_PREFIX || path === `${DAV_PREFIX}/`) {
+    if (path === DAV_PREFIX || path === DAV_PREFIX + "/") {
       relativePath = "/";
-    } else if (path.startsWith(`${DAV_PREFIX}/`)) {
+    } else if (path.startsWith(DAV_PREFIX + "/")) {
       relativePath = path.slice(DAV_PREFIX.length);
     }
     const node = relativePath === null ? null : lookup(fixture.root, relativePath);
     if (relativePath === null || node === null) {
-      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("not found");
+      replyText(404, "not found");
       return;
     }
 
     if (req.method === "OPTIONS") {
-      res.writeHead(200, {
-        Allow: "OPTIONS, PROPFIND, GET, HEAD",
-        DAV: "1, 2"
-      });
-      res.end();
+      reply(200, { Allow: "OPTIONS, PROPFIND, GET, HEAD", DAV: "1, 2" });
       return;
     }
 
@@ -361,28 +487,24 @@ export async function startWebDavServer(options = {}) {
       const depthHeader = String(req.headers.depth ?? "1").toLowerCase();
       const depth = depthHeader === "0" ? 0 : depthHeader === "infinity" ? Number.POSITIVE_INFINITY : 1;
       const xml = propfindResponseXml(relativePath, node, depth, extraHrefs);
-      res.writeHead(207, {
-        "Content-Type": "text/xml; charset=utf-8",
-        "Content-Length": Buffer.byteLength(xml)
-      });
-      res.end(xml);
+      reply(207, { "Content-Type": "text/xml; charset=utf-8", "Content-Length": Buffer.byteLength(xml) }, xml);
       return;
     }
 
     if (req.method === "GET" || req.method === "HEAD") {
       if (node.type === "dir") {
         const names = [...node.children.keys()].map(escapeXml).join(", ");
-        const html = `<html><body><h1>Index of ${escapeXml(relativePath)}</h1><p>${names}</p></body></html>`;
-        res.writeHead(200, {
-          "Content-Type": "text/html; charset=utf-8",
-          "Content-Length": Buffer.byteLength(html)
-        });
-        res.end(req.method === "HEAD" ? undefined : html);
+        const html = "<html><body><h1>Index of " + escapeXml(relativePath) + "</h1><p>" + names + "</p></body></html>";
+        reply(
+          200,
+          { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(html) },
+          req.method === "HEAD" ? undefined : html
+        );
         return;
       }
 
       const bytes = node.bytes;
-      const range = parseRange(req.headers.range, bytes.length);
+      const range = ignoreRange ? null : parseRange(req.headers.range, bytes.length);
       const headers = {
         "Content-Type": contentTypeOf(relativePath),
         "Accept-Ranges": "bytes",
@@ -391,22 +513,29 @@ export async function startWebDavServer(options = {}) {
 
       if (range !== null) {
         const slice = bytes.subarray(range.start, range.end + 1);
-        res.writeHead(206, {
-          ...headers,
-          "Content-Range": `bytes ${range.start}-${range.end}/${bytes.length}`,
-          "Content-Length": slice.length
-        });
-        res.end(req.method === "HEAD" ? undefined : Buffer.from(slice));
+        reply(
+          206,
+          {
+            ...headers,
+            "Content-Range": "bytes " + range.start + "-" + range.end + "/" + bytes.length,
+            "Content-Length": slice.length
+          },
+          req.method === "HEAD" ? undefined : Buffer.from(slice),
+          req.method === "HEAD" ? 0 : slice.length
+        );
         return;
       }
 
-      res.writeHead(200, { ...headers, "Content-Length": bytes.length });
-      res.end(req.method === "HEAD" ? undefined : Buffer.from(bytes));
+      reply(
+        200,
+        { ...headers, "Content-Length": bytes.length },
+        req.method === "HEAD" ? undefined : Buffer.from(bytes),
+        req.method === "HEAD" ? 0 : bytes.length
+      );
       return;
     }
 
-    res.writeHead(405, { Allow: "OPTIONS, PROPFIND, GET, HEAD" });
-    res.end();
+    reply(405, { Allow: "OPTIONS, PROPFIND, GET, HEAD" });
   });
 
   await new Promise((resolve) => {

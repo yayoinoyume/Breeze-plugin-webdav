@@ -34,6 +34,8 @@ export type ZipEndRecord = {
 };
 
 export const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
+/** 压缩数据本身的硬上限（deflate 不会比原文大太多；挡住谎报 compressedSize 的包）。 */
+export const MAX_COMPRESSED_ENTRY_BYTES = 64 * 1024 * 1024;
 export const MAX_COMPRESSION_RATIO = 1000;
 export const LOCAL_HEADER_BYTES = 30;
 const INFLATE_INPUT_CHUNK = 8 * 1024;
@@ -182,6 +184,7 @@ export function listZipImages(entries: ZipEntry[]): ZipEntry[] {
     .sort((left, right) => naturalCompare(left.name, right.name));
 }
 
+/** 整包路径沿用的基础检查：加密、解压后尺寸、压缩比。 */
 function assertEntryWithinLimits(entry: ZipEntry): void {
   if ((entry.flags & 1) !== 0) {
     throw new Error("CBZ 里的文件被加密了，暂不支持");
@@ -196,6 +199,21 @@ function assertEntryWithinLimits(entry: ZipEntry): void {
     entry.uncompressedSize / entry.compressedSize > MAX_COMPRESSION_RATIO
   ) {
     throw new Error("CBZ 压缩比异常（可能损坏或恶意包），已拒绝解压");
+  }
+}
+
+/**
+ * 远程取字节前的硬性预检：在基础检查之外，再挡住谎报的超大 compressedSize。
+ * 必须在发任何字节请求之前调用，避免先下满再报错。
+ */
+export function assertEntrySafeToExtract(entry: ZipEntry): void {
+  assertEntryWithinLimits(entry);
+  if (entry.compressedSize > MAX_COMPRESSED_ENTRY_BYTES) {
+    throw new Error(
+      "CBZ 里的这一页压缩数据太大（超过 " +
+        MAX_COMPRESSED_ENTRY_BYTES / (1024 * 1024) +
+        " MiB），暂不支持"
+    );
   }
 }
 

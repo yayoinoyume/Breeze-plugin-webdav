@@ -313,23 +313,53 @@ async function main() {
     const bigFirst = bigSnapshot.data.chapter.pages[0];
     const firstPageBytes = await mod.fetchImageBytes({ url: bigFirst.url, extern: bigFirst.extern });
     check(firstPageBytes instanceof Uint8Array && firstPageBytes.length > 0, "大包第一页应有字节");
-    const firstScreenBytes = server.requests
+    const singlePageBytes = server.requests
       .slice(mark)
       .reduce((sum, record) => sum + record.responseBytes, 0);
     const packageBytes = server.fixture.bigCbz.length;
-    const ratio = firstScreenBytes / packageBytes;
+    const singleRatio = singlePageBytes / packageBytes;
     check(
-      ratio < 0.05,
-      "CBZ 首屏下载应小于包大小 5%，实际 " + firstScreenBytes + " / " + packageBytes
+      singleRatio < 0.015,
+      "CBZ 单页首屏应小于包大小 1.5%，实际 " + singlePageBytes + " / " + packageBytes
+    );
+
+    for (let index = 1; index < 3; index += 1) {
+      const page = bigSnapshot.data.chapter.pages[index];
+      await mod.fetchImageBytes({ url: page.url, extern: page.extern });
+    }
+    const threePageBytes = server.requests
+      .slice(mark)
+      .reduce((sum, record) => sum + record.responseBytes, 0);
+    const threeRatio = threePageBytes / packageBytes;
+
+    for (let index = 3; index < 5; index += 1) {
+      const page = bigSnapshot.data.chapter.pages[index];
+      await mod.fetchImageBytes({ url: page.url, extern: page.extern });
+    }
+    const fivePageBytes = server.requests
+      .slice(mark)
+      .reduce((sum, record) => sum + record.responseBytes, 0);
+    const fiveRatio = fivePageBytes / packageBytes;
+    check(
+      fiveRatio < 0.06,
+      "CBZ 5 页合计应小于包大小 6%，实际 " + fivePageBytes + " / " + packageBytes
     );
     console.error(
-      "[e2e] CBZ 首屏下载字节 packageBytes=" +
+      "[e2e] CBZ 下载字节 packageBytes=" +
         packageBytes +
-        " firstScreenBytes=" +
-        firstScreenBytes +
-        " ratio=" +
-        (ratio * 100).toFixed(2) +
-        "%"
+        " singlePage=" +
+        singlePageBytes +
+        " (" +
+        (singleRatio * 100).toFixed(2) +
+        "%) threePages=" +
+        threePageBytes +
+        " (" +
+        (threeRatio * 100).toFixed(2) +
+        "%) fivePages=" +
+        fivePageBytes +
+        " (" +
+        (fiveRatio * 100).toFixed(2) +
+        "%)"
     );
 
     console.log(

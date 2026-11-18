@@ -18,6 +18,7 @@ import {
   startWebDavServer
 } from "../script/test-webdav-server.mjs";
 import * as comics from "../src/comics.ts";
+import { EOCD_TAIL_BYTES } from "../src/zip/remote-zip.ts";
 import { SETTING_KEYS } from "../src/settings.ts";
 import { createWebDavClient } from "../src/webdav/client.ts";
 
@@ -142,7 +143,7 @@ test("zip-comment-too-large 注释超过 64 KiB 窗口时给明确中文错误",
     await assert.rejects(
       () => comics.fetchPageBytes(client, { kind: "cbz", path: "/长注释.cbz", index: 0 }),
       (error) => {
-        assert.match(error.message, /注释/, "错误文案应点明注释过大");
+        assert.match(error.message, /注释|找不到中央目录/, "错误文案应点明注释过大或中央目录缺失");
         assert.match(error.message, /CBZ|ZIP/i);
         return true;
       }
@@ -150,6 +151,39 @@ test("zip-comment-too-large 注释超过 64 KiB 窗口时给明确中文错误",
   } finally {
     await server.close();
   }
+});
+
+test("five-page-ratio 单页 <1.5%、5 页 <6% 的包大小口径", async () => {
+  const item = await findBigCbzItem();
+  const packageSize = bigServer.fixture.bigCbz.length;
+  comics.clearRemoteZipCache();
+  const mark = bigServer.requests.length;
+
+  const snapshot = await comics.getReadSnapshot({ comicId: item.id });
+  const pages = snapshot.data.chapter.pages;
+  const firstBytes = await comics.fetchImageBytes({ url: pages[0].url, extern: pages[0].extern });
+  assert.ok(firstBytes.length > 0);
+  const singleScreenBytes = bigServer.requests
+    .slice(mark)
+    .reduce((sum, record) => sum + record.responseBytes, 0);
+  const singleRatio = singleScreenBytes / packageSize;
+  assert.ok(
+    singleRatio < 0.015,
+    "单页首屏应小于包大小 1.5%，实际 " + (singleRatio * 100).toFixed(2) + "%"
+  );
+
+  for (let index = 1; index < 5; index += 1) {
+    const page = pages[index];
+    await comics.fetchImageBytes({ url: page.url, extern: page.extern });
+  }
+  const fivePageBytes = bigServer.requests
+    .slice(mark)
+    .reduce((sum, record) => sum + record.responseBytes, 0);
+  const fiveRatio = fivePageBytes / packageSize;
+  assert.ok(
+    fiveRatio < 0.06,
+    "5 页合计应小于包大小 6%，实际 " + (fiveRatio * 100).toFixed(2) + "%"
+  );
 });
 
 test("zip64-rejected ZIP64 包被明确拒绝", async () => {
@@ -223,7 +257,8 @@ test("remote-zip-inflight-dedup 并发取同一包 5 页只读一次中央目录
     ]);
 
     const added = server.requests.slice(mark);
-    const tailRange = "bytes=" + (server.fixture.cbz.length - 65536) + "-" + (server.fixture.cbz.length - 1);
+    const tailRange =
+      "bytes=" + (server.fixture.cbz.length - EOCD_TAIL_BYTES) + "-" + (server.fixture.cbz.length - 1);
     assert.equal(
       added.filter((record) => record.range === tailRange).length,
       1,

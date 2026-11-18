@@ -31,7 +31,7 @@ import { loadSettings } from "./settings.ts";
 import type { WebDavSettings } from "./settings.ts";
 import { createWebDavClient } from "./webdav/client.ts";
 import type { WebDavClient } from "./webdav/client.ts";
-import { downloadFileBytes } from "./http/download.ts";
+import { downloadFileBytes, MAX_DOWNLOAD_BYTES } from "./http/download.ts";
 import {
   scanComicsDetailed,
   skippedEntriesWarning,
@@ -77,12 +77,18 @@ const inflightZip = new Map<string, Promise<Uint8Array>>();
 
 /** 中央目录缓存上限：每个包几十 KB，只缓存小索引，不缓存整包。 */
 const REMOTE_ZIP_CACHE_LIMIT = 16;
+const REMOTE_ZIP_CACHE_BUDGET_BYTES = 8 * 1024 * 1024;
 const REMOTE_ZIP_DIAGNOSTIC_LIMIT = 20;
+
+let remoteZipCacheBudget = REMOTE_ZIP_CACHE_BUDGET_BYTES;
+let remoteZipDownloadLimit = MAX_DOWNLOAD_BYTES;
 
 type CachedRemoteZip = {
   key: string;
   path: string;
   info: RemoteZipInfo;
+  /** 估算的索引占用字节（只算条目名与结构，不算整包）。 */
+  bytes: number;
 };
 
 const remoteZipCache: CachedRemoteZip[] = [];
@@ -90,6 +96,7 @@ const inflightRemoteZip = new Map<string, Promise<RemoteZipInfo>>();
 /** 判定过「服务器不支持 Range」的包：之后的取页直接走整包，不再重复试错。 */
 const remoteZipFallbackKeys = new Set<string>();
 const remoteZipDiagnostics: string[] = [];
+const remoteZipDiagnosticKeys = new Set<string>();
 
 type ScanCacheEntry = {
   key: string;
@@ -128,6 +135,34 @@ export function getRemoteZipDiagnostics(): string[] {
 /** 清空远程取页诊断（测试用）。 */
 export function clearRemoteZipDiagnostics(): void {
   remoteZipDiagnostics.length = 0;
+  remoteZipDiagnosticKeys.clear();
+}
+
+/** 中央目录缓存当前估算字节数（测试用）。 */
+export function remoteZipCacheBytes(): number {
+  let total = 0;
+  for (const entry of remoteZipCache) {
+    total += entry.bytes;
+  }
+  return total;
+}
+
+/** 中央目录缓存里的包路径（测试用，最近使用的在前）。 */
+export function remoteZipCacheKeys(): string[] {
+  return remoteZipCache.map((entry) => entry.path);
+}
+
+/** 调整中央目录缓存预算（测试用）；传 null 恢复默认。 */
+export function setRemoteZipCacheBudgetForTests(bytes: number | null): void {
+  remoteZipCacheBudget =
+    bytes === null ? REMOTE_ZIP_CACHE_BUDGET_BYTES : Math.max(1, Math.trunc(bytes));
+  trimRemoteZipCache();
+}
+
+/** 调整远程取页的单响应体上限（测试用）；传 null 恢复默认 256 MiB。 */
+export function setRemoteZipDownloadLimitForTests(bytes: number | null): void {
+  remoteZipDownloadLimit =
+    bytes === null ? MAX_DOWNLOAD_BYTES : Math.max(1, Math.trunc(bytes));
 }
 
 /** 调整 CBZ 缓存预算（测试用）；传 null 恢复默认。 */
@@ -531,17 +566,45 @@ function remoteZipSource(client: WebDavClient, path: string): RemoteZipSource {
   return {
     url: client.urlFor(path),
     headers: client.authHeaders(),
-    request: client.options.request ?? hostRequest
+    request: client.options.request ?? hostRequest,
+    maxDownloadBytes: remoteZipDownloadLimit
   };
 }
 
-/** 记一次回退诊断（同一个包只记一次），并标记该包以后直接走整包。 */
-function rememberRemoteZipFallback(client: WebDavClient, path: string, reason: string): void {
+/** 条目名 + 结构的粗略占用，用来给中央目录缓存做字节预算。 */
+function estimateRemoteZipBytes(info: RemoteZipInfo): number {
+  let total = 64;
+  for (const entry of info.entries) {
+    total += 64 + entry.name.length * 2;
+  }
+  return total;
+}
+
+function trimRemoteZipCache(): void {
+  let total = remoteZipCacheBytes();
+  while (remoteZipCache.length > 1 && total > remoteZipCacheBudget) {
+    const removed = remoteZipCache.pop();
+    if (removed === undefined) {
+      break;
+    }
+    total -= removed.bytes;
+  }
+}
+
+/** 记一次回退诊断（同一个包 + 同一种原因只记一次），并标记该包以后直接走整包。 */
+function rememberRemoteZipFallback(
+  client: WebDavClient,
+  path: string,
+  kind: string,
+  reason: string
+): void {
   const key = zipCacheKey(client, path);
   remoteZipFallbackKeys.add(key);
-  if (remoteZipDiagnostics.some((item) => item.indexOf(key) >= 0)) {
+  const dedupe = key + "|" + kind;
+  if (remoteZipDiagnosticKeys.has(dedupe)) {
     return;
   }
+  remoteZipDiagnosticKeys.add(dedupe);
   const text = "CBZ 远程取页不可用，已回退整包下载（" + path + "）：" + reason;
   remoteZipDiagnostics.push(text);
   if (remoteZipDiagnostics.length > REMOTE_ZIP_DIAGNOSTIC_LIMIT) {
@@ -584,7 +647,7 @@ async function tryOpenRemoteZip(
       return await pending;
     } catch (error) {
       if (error instanceof RemoteZipRangeUnsupportedError) {
-        rememberRemoteZipFallback(client, path, error.message);
+        rememberRemoteZipFallback(client, path, error.kind, error.message);
         if (error.fullBytes !== null) {
           seedZipCache(client, path, error.fullBytes);
         }
@@ -596,10 +659,16 @@ async function tryOpenRemoteZip(
 
   const task = openRemoteZip(remoteZipSource(client, path)).then(
     (info) => {
-      remoteZipCache.unshift({ key, path, info });
+      remoteZipCache.unshift({
+        key,
+        path,
+        info,
+        bytes: estimateRemoteZipBytes(info)
+      });
       while (remoteZipCache.length > REMOTE_ZIP_CACHE_LIMIT) {
         remoteZipCache.pop();
       }
+      trimRemoteZipCache();
       inflightRemoteZip.delete(key);
       return info;
     },
@@ -614,7 +683,7 @@ async function tryOpenRemoteZip(
     return await task;
   } catch (error) {
     if (error instanceof RemoteZipRangeUnsupportedError) {
-      rememberRemoteZipFallback(client, path, error.message);
+      rememberRemoteZipFallback(client, path, error.kind, error.message);
       if (error.fullBytes !== null) {
         seedZipCache(client, path, error.fullBytes);
       }
@@ -666,7 +735,7 @@ async function fetchZipPageBytes(
       if (!(error instanceof RemoteZipRangeUnsupportedError)) {
         throw error;
       }
-      rememberRemoteZipFallback(client, path, error.message);
+      rememberRemoteZipFallback(client, path, error.kind, error.message);
       if (error.fullBytes !== null) {
         seedZipCache(client, path, error.fullBytes);
       }

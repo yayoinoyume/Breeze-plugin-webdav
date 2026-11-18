@@ -6,8 +6,9 @@
  *
  * 额外开关（给 CBZ 远程取页测试用）：
  * - bigCbz: true     根目录放一个 ≥50 MiB、120 页的 CBZ（stored 与 deflate 混合）
- * - edgeCbz: true    放三个边界包：注释 65535 B、ZIP64、CRC 被篡改
+ * - edgeCbz: true    放边界包：注释上限 65535 B、非法注释（多 1 B）、ZIP64、CRC 被篡改、声明超大 compressedSize
  * - ignoreRange: true 服务器忽略 Range，GET 一律返回 200 整包
+ * - failRangeOnce: true 第一次带 Range 的 GET 返回 503，用来验证重试
  */
 
 import { createServer } from "node:http";
@@ -80,14 +81,33 @@ function findEocd(bytes) {
   throw new Error("测试 ZIP 里找不到 EOCD");
 }
 
-/** 给归档加一条超长注释（ZIP 规范上限 65535 字节）。 */
-function withZipComment(zip, commentLength) {
+/** 给归档加一条超长注释（ZIP 规范上限 65535 字节）；extraTail 用来构造非法包。 */
+function withZipComment(zip, commentLength, extraTail = 0) {
   const eocd = findEocd(zip);
-  const out = new Uint8Array(eocd + 22 + commentLength);
+  const out = new Uint8Array(eocd + 22 + commentLength + extraTail);
   out.set(zip.subarray(0, eocd + 22), 0);
   writeU16(out, eocd + 20, commentLength);
   out.fill(0x20, eocd + 22);
   return out;
+}
+
+/** 篡改中央目录里某条目的 compressedSize（数据本身不变）。 */
+function withBrokenCompressedSize(zip, compressedSize, entryName) {
+  const out = zip.slice();
+  for (let offset = 0; offset + 46 <= out.length; offset += 1) {
+    if (readU32(out, offset) !== 0x02014b50) {
+      continue;
+    }
+    const nameLength = out[offset + 28] | (out[offset + 29] << 8);
+    const name = new TextDecoder("utf-8").decode(
+      out.subarray(offset + 46, offset + 46 + nameLength)
+    );
+    if (name === entryName) {
+      writeU32(out, offset + 20, compressedSize);
+      return out;
+    }
+  }
+  throw new Error("测试 ZIP 里找不到条目：" + entryName);
 }
 
 /** 把 EOCD 的中央目录偏移改成 ZIP64 哨兵值。 */
@@ -215,14 +235,18 @@ export function createFixture(options = {}) {
       ["002.png", edgeFiles.get("002.png"), 6]
     ]);
     edgeCbz = {
-      commentTooLarge: withZipComment(base, 65535),
+      commentMax: withZipComment(base, 65535),
+      commentInvalid: withZipComment(base, 65535, 1),
       zip64: asZip64Sentinel(base),
       crcMismatch: withBrokenCrc(base, "001.png"),
+      compressedTooLarge: withBrokenCompressedSize(base, 64 * 1024 * 1024 + 1, "001.png"),
       entries: edgeFiles
     };
-    rootChildren["长注释.cbz"] = file(edgeCbz.commentTooLarge);
+    rootChildren["注释上限.cbz"] = file(edgeCbz.commentMax);
+    rootChildren["长注释.cbz"] = file(edgeCbz.commentInvalid);
     rootChildren["zip64.cbz"] = file(edgeCbz.zip64);
     rootChildren["坏CRC.cbz"] = file(edgeCbz.crcMismatch);
+    rootChildren["压缩超限.cbz"] = file(edgeCbz.compressedTooLarge);
   }
 
   const root = dir(rootChildren);
@@ -427,6 +451,8 @@ export async function startWebDavServer(options = {}) {
   const extraHrefs = Array.isArray(options.extraHrefs) ? options.extraHrefs : [];
   const forbiddenPaths = Array.isArray(options.forbiddenPaths) ? options.forbiddenPaths : [];
   const ignoreRange = options.ignoreRange === true;
+  const failRangeOnce = options.failRangeOnce === true;
+  let rangeFailed = false;
   const requests = [];
 
   const server = createServer((req, res) => {
@@ -449,6 +475,7 @@ export async function startWebDavServer(options = {}) {
     requests.push(record);
 
     const reply = (status, headers, body, byteLength) => {
+      record.status = status;
       record.responseBytes = byteLength ?? (body === undefined ? 0 : Buffer.byteLength(body));
       res.writeHead(status, headers);
       res.end(body);
@@ -488,6 +515,17 @@ export async function startWebDavServer(options = {}) {
       const depth = depthHeader === "0" ? 0 : depthHeader === "infinity" ? Number.POSITIVE_INFINITY : 1;
       const xml = propfindResponseXml(relativePath, node, depth, extraHrefs);
       reply(207, { "Content-Type": "text/xml; charset=utf-8", "Content-Length": Buffer.byteLength(xml) }, xml);
+      return;
+    }
+
+    if (
+      failRangeOnce &&
+      !rangeFailed &&
+      req.method === "GET" &&
+      typeof req.headers.range === "string"
+    ) {
+      rangeFailed = true;
+      replyText(503, "temporary range failure");
       return;
     }
 

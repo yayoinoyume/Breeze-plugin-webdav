@@ -1,17 +1,18 @@
 /**
- * 反斜杠绕过回归测试。
+ * 请求层只拒绝「真实危险路径」：解码文本里的字面反斜杠、.. 段、控制字符。
  *
- * 只按 "/" 分段时，"/..\..\secret" 里的 ".." 不是独立段，
- * 会原样发成 /dav/..%5C..%5Csecret；某些 WebDAV 服务器把反斜杠当目录分隔符，
- * 于是能读到 rootPath 之外。这里断言相对路径、绝对 URL、%5C 编码形式都被拒绝，
- * 而且一次请求都不会发出去。
+ * 注意 urlFor 的内部参数是解码文本（列表层给的就是解码后的 path），
+ * 所以 "%5C" / "%2e%2e" 这种字面文件名是合法的，不应被拒；
+ * 绝对 URL 的参数还是编码形态，会先宽松解码一次再检查。
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeDavPath } from "../src/util/names.ts";
 import { createWebDavClient } from "../src/webdav/client.ts";
 
-test("backslash-traversal 反斜杠路径一律拒绝，且不发请求", async () => {
+const BACKSLASH = String.fromCharCode(92);
+
+test("backslash-traversal 真实危险路径一律拒绝，合法怪名字放行", async () => {
   const requests = [];
   const client = createWebDavClient({
     baseUrl: "http://nas.local/dav",
@@ -28,33 +29,37 @@ test("backslash-traversal 反斜杠路径一律拒绝，且不发请求", async 
   });
 
   // 内部路径（normalize 层）：字面反斜杠直接拒绝。
-  assert.throws(() => normalizeDavPath("/..\\..\\secret"), /反斜杠/);
-  assert.throws(() => normalizeDavPath("..\\..\\secret"), /反斜杠/);
-  assert.throws(() => normalizeDavPath("/comics\\..\\secret"), /反斜杠/);
+  assert.throws(() => normalizeDavPath("/.." + BACKSLASH + ".." + BACKSLASH + "secret"), /反斜杠/);
+  assert.throws(() => normalizeDavPath(".." + BACKSLASH + "secret"), /反斜杠/);
 
-  // 相对路径（URL 层）：字面量与 %5C / %5c 编码形式都要拦。
-  assert.throws(() => client.urlFor("/..\\..\\secret"), /反斜杠/);
-  assert.throws(() => client.urlFor("/..%5C..%5Csecret"), /反斜杠/);
-  assert.throws(() => client.urlFor("/..%5c..%5csecret"), /反斜杠/);
-  assert.throws(() => client.urlFor("..\\..\\secret"), /反斜杠/);
+  // 相对路径（解码文本）：字面反斜杠、真实 .. 段拒绝。
+  assert.throws(() => client.urlFor("/.." + BACKSLASH + ".." + BACKSLASH + "secret"), /反斜杠/);
+  assert.throws(() => client.urlFor(".." + BACKSLASH + "secret"), /反斜杠/);
+  assert.throws(() => client.urlFor("/comics/../secret"), /不能包含 \.\./);
 
-  // 绝对 URL 同样要过同一道检查。
-  assert.throws(
-    () => client.urlFor("http://nas.local/dav/..\\..\\secret"),
-    /反斜杠/
+  // 字面 %5C / %2e%2e 是合法文件名，不能误杀。
+  assert.equal(
+    client.urlFor("/a%5Cb.png"),
+    "http://nas.local/dav/a%255Cb.png"
   );
+  assert.equal(
+    client.urlFor("/%252e%252e/x.png"),
+    "http://nas.local/dav/%25252e%25252e/x.png"
+  );
+  assert.equal(client.canRequest("/a%5Cb.png"), true);
+  assert.equal(client.canRequest("/comics/../secret"), false);
+  assert.equal(client.canRequest("/comics" + BACKSLASH + "secret"), false);
+
+  // 绝对 URL 是编码形态：先宽松解码一次再检查。
   assert.throws(
     () => client.urlFor("http://nas.local/dav/..%5C..%5Csecret"),
     /反斜杠/
   );
+  assert.throws(
+    () => client.urlFor("http://nas.local/dav/%2e%2e/secret"),
+    /不能包含 \.\./
+  );
 
-  // 双重编码防御：%255C 解码一次是 %5C、两次才是 \；%252e%252e 两次才是 ..。
-  assert.throws(() => client.urlFor("/..%255C..%255Csecret"), /反斜杠/);
-  assert.throws(() => client.urlFor("/%252e%252e/secret"), /不能包含 \.\./);
-
-  // 走完整链路（PROPFIND）也必须先抛，请求数为 0。
-  await assert.rejects(() => client.list("/..%5C..%5Csecret"), /反斜杠/);
-  await assert.rejects(() => client.propfind("/..\\..\\secret"), /反斜杠/);
   assert.equal(requests.length, 0, "被拒绝的路径不应发出任何请求");
 
   // 正常路径不受影响。
@@ -63,5 +68,4 @@ test("backslash-traversal 反斜杠路径一律拒绝，且不发请求", async 
     client.urlFor("/漫画/第 01 页.png"),
     "http://nas.local/dav/%E6%BC%AB%E7%94%BB/%E7%AC%AC%2001%20%E9%A1%B5.png"
   );
-  assert.equal(requests.length, 0);
 });

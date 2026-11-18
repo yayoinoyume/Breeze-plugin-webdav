@@ -6,12 +6,12 @@
  * - includeCbz 时 .cbz/.zip 文件各自是一本漫画；
  * - 没有图片的目录继续向下，层级最多到 scanDepth（根为第 0 层）；
  * - 总数最多 maxComics 本；列目录请求最多 maxListCalls 次。
- * - 列目录时遇到名字不安全的条目（反斜杠 / 可疑 .. / 控制字符，判定见 isUnsafeHref），
- *   在 rootPath 内的跳过并计数，通过 warning 上报；绝不能让一条脏数据弄挂整次扫描。
+ * - 列表层不做安全判定：名字再怪也照常参与扫描；只有「下钻目录」前用 canRequest 兜底，
+ *   单次列目录失败也只跳过该目录并计数，绝不让一条脏数据弄挂整次扫描。
  */
 
 import type { DavEntry } from "./xml.ts";
-import { isUnsafeHref } from "./client.ts";
+import { USER_MESSAGES, friendlyMessage } from "../errors.ts";
 import {
   baseName,
   comicTitle,
@@ -40,6 +40,8 @@ export type ComicLister = {
   list(input?: string, depth?: number): Promise<DavEntry[]>;
   /** 把服务器返回的 href 换算成相对服务器根路径的路径；不在根路径下返回 null。 */
   relativePath(href: string): string | null;
+  /** 这条路径能否发请求（不抛就 true）。缺省视为可以，便于老测试桩。 */
+  canRequest?(input: string): boolean;
 };
 
 export type ScanOptions = {
@@ -80,12 +82,23 @@ function budgetWarning(limit: number): string {
   return "目录太多，扫描已在上限 " + limit + " 次列目录请求处停止，结果可能不完整";
 }
 
-/** 列目录时跳过脏条目的中文提示（带数量）。 */
-export function dirtyEntriesWarning(count: number): string {
+/**
+ * 哪些列目录失败属于「整体不可用」，必须向上抛：
+ * 认证失败、服务器不支持 PROPFIND、宿主太旧。其余（单个目录超时/404 等）只跳过该目录。
+ */
+export function isFatalListError(error: unknown): boolean {
+  const message = friendlyMessage(error);
   return (
-    "有 " +
-    count +
-    " 个条目名字含反斜杠或可疑 ..（服务器可能把它当目录分隔符），已跳过这些条目"
+    message === USER_MESSAGES.auth ||
+    message === USER_MESSAGES.propfind ||
+    message === USER_MESSAGES.oldHost
+  );
+}
+
+/** 列表阶段确实跳过条目/列目录失败时的中文提示（带数量）。 */
+export function skippedEntriesWarning(count: number): string {
+  return (
+    "有 " + count + " 个条目无法安全读取（路径不安全或列目录失败），已跳过这些条目"
   );
 }
 
@@ -118,7 +131,17 @@ export async function scanComicsDetailed(
     }
 
     listCalls += 1;
-    const entries = await lister.list(current.path, 1);
+    let entries: DavEntry[];
+    try {
+      entries = await lister.list(current.path, 1);
+    } catch (error) {
+      // 认证/协议级错误整体抛；单个目录的局部失败只跳过它，整次扫描继续。
+      if (isFatalListError(error)) {
+        throw error;
+      }
+      skippedEntries += 1;
+      continue;
+    }
     const children: Array<{ entry: DavEntry; path: string }> = [];
     for (const entry of entries) {
       const relative = lister.relativePath(entry.href);
@@ -130,14 +153,7 @@ export async function scanComicsDetailed(
         // 不在设置的 rootPath 下（例如服务器多返回了别处的条目）：静默忽略。
         continue;
       }
-      if (isUnsafeHref(entry.href)) {
-        // 一条脏条目不能弄挂整次扫描：跳过并计数。
-        // 只统计「本来会进结果集」的条目（目录 / 图片 / CBZ），普通文件不算。
-        if (entry.isCollection || isImageFile(relative) || (includeCbz && isCbzFile(relative))) {
-          skippedEntries += 1;
-        }
-        continue;
-      }
+      // 列表层不做安全判定：名字再怪也进结果集，只有真正要发请求时才可能失败。
       children.push({ entry, path: relative });
     }
     children.sort((left, right) => naturalCompare(left.path, right.path));
@@ -178,16 +194,23 @@ export async function scanComicsDetailed(
 
     if (images.length === 0 && current.depth < scanDepth) {
       for (const child of children) {
-        if (child.entry.isCollection) {
-          queue.push({ path: child.path, depth: current.depth + 1 });
+        if (!child.entry.isCollection) {
+          continue;
         }
+        // 下钻前才判定：这条路径发不出去（含字面 .. / 反斜杠 / 控制字符）就跳过并计数，
+        // 不要等 list 抛了再挂掉整次扫描。
+        if (lister.canRequest !== undefined && !lister.canRequest(child.path)) {
+          skippedEntries += 1;
+          continue;
+        }
+        queue.push({ path: child.path, depth: current.depth + 1 });
       }
     }
   }
 
   const warnings: string[] = [];
   if (skippedEntries > 0) {
-    warnings.push(dirtyEntriesWarning(skippedEntries));
+    warnings.push(skippedEntriesWarning(skippedEntries));
   }
   if (budgetStopped) {
     warnings.push(budgetWarning(maxListCalls));

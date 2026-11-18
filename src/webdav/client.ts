@@ -25,6 +25,8 @@ export type WebDavClient = {
   readonly options: WebDavClientOptions;
   authHeaders(): Record<string, string>;
   urlFor(input: string): string;
+  /** 这条内部路径能否安全发请求（urlFor 不抛就为 true）。列表层用它兜底下钻，本身不抛。 */
+  canRequest(input: string): boolean;
   propfind(input: string, depth?: number): Promise<DavEntry[]>;
   list(input?: string, depth?: number): Promise<DavEntry[]>;
   /** 把服务器返回的 href 换算成相对根路径的路径；不在根路径下返回 null。 */
@@ -65,30 +67,21 @@ export function encodePath(path: string): string {
 const CONTROL_CHAR_PATTERN = /[\u0000-\u001F\u007F]/;
 
 /**
- * 拒绝路径里的 .. 段、反斜杠与控制字符（单重与双重百分号编码都要拦），绝对 URL 与相对路径都要过。
+ * 拒绝真实危险路径：字面反斜杠、.. 段、NUL/控制字符。
  *
- * 为什么解码两次：内部路径里若出现字面 "%5C" / "%2e%2e"，编码上线后会变成
- * %255C / %252e%252e；只解一次看不出危险，但会二次解码的服务器仍可能越界。
- * 这里按「解码一次」和「解码两次」的结果分别检查，宁可拒绝一个合法文件名也不错放越界。
+ * 传入的必须是「解码后的文本」（内部 path 一律是解码文本，urlFor 负责逐段编码上线）。
+ * 不做第二次 decode：%2e%2e、%5C 这类字面文件名是合法名字，必须放行。
  */
 function assertNoTraversalPath(path: string, context: string): void {
-  for (const rawSegment of String(path ?? "").split("/")) {
-    const decodedOnce = decodePercentSafe(rawSegment);
-    for (const segment of [decodedOnce, decodePercentSafe(decodedOnce)]) {
-      // 反斜杠：某些服务器把它当目录分隔符，/..\..\secret 会越出 rootPath。
-      if (segment.includes("\\")) {
-        throw new Error(context + "里不能包含反斜杠（服务器可能把它当成目录分隔符）");
-      }
-      // NUL / 控制字符：名字已损坏，不允许进请求。
-      if (CONTROL_CHAR_PATTERN.test(segment)) {
-        throw new Error(context + "里不能包含控制字符（名字已损坏）");
-      }
-      // %2F 解码后可能再生出新的分段，逐个再查一遍。
-      for (const sub of segment.split("/")) {
-        if (sub === "..") {
-          throw new Error(context + "里不能包含 ..（上级目录）");
-        }
-      }
+  for (const segment of String(path ?? "").split("/")) {
+    if (segment.includes("\\")) {
+      throw new Error(context + "里不能包含反斜杠（服务器可能把它当成目录分隔符）");
+    }
+    if (CONTROL_CHAR_PATTERN.test(segment)) {
+      throw new Error(context + "里不能包含控制字符（名字已损坏）");
+    }
+    if (segment === "..") {
+      throw new Error(context + "里不能包含 ..（上级目录）");
     }
   }
 }
@@ -100,7 +93,8 @@ function encodeAbsoluteUrl(url: string): string {
   }
   const origin = matched[1].replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, "$1");
   const path = matched[2] === "" ? "/" : matched[2];
-  assertNoTraversalPath(path, "URL 路径");
+  // 绝对 URL 来自外部输入，路径还是编码形态：先宽松解码一次再检查（解不开就按原文）。
+  assertNoTraversalPath(decodePercentSafe(path), "URL 路径");
   return `${origin}${encodePath(path)}${matched[3]}`;
 }
 
@@ -239,47 +233,6 @@ function rawUrlPath(value: string): string {
   return path;
 }
 
-function decodePercentStrict(text: string): string | null {
-  try {
-    return decodeURIComponent(text);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 列目录时的「不安全条目」判定：纯函数，永不抛异常。
- *
- * 规则与请求层 assertNoTraversalPath 对齐：href 的路径解码两次后若含反斜杠、
- * 含 .. 段、含 NUL/控制字符，或者百分号编码根本解不开（无法证明安全），
- * 就判为 unsafe。列表层遇到 unsafe 条目只跳过并计数，请求层遇到同类内部路径仍然抛错。
- */
-export function isUnsafeHref(href: string): boolean {
-  const path = rawUrlPath(href);
-  if (path.includes("\\")) {
-    return true;
-  }
-  const decodedOnce = decodePercentStrict(path);
-  if (decodedOnce === null) {
-    return true;
-  }
-  const decodedTwice = decodePercentStrict(decodedOnce);
-  if (decodedTwice === null) {
-    return true;
-  }
-  for (const candidate of [decodedOnce, decodedTwice]) {
-    if (candidate.includes("\\") || CONTROL_CHAR_PATTERN.test(candidate)) {
-      return true;
-    }
-    for (const segment of candidate.split("/")) {
-      if (segment === "..") {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 /** 折叠重复斜杠、去掉结尾斜杠（只整理字符串，不做安全检查）。 */
 function tidyRelativePath(value: string): string {
   let out = value.startsWith("/") ? value : "/" + value;
@@ -293,8 +246,8 @@ function tidyRelativePath(value: string): string {
 /**
  * 把 href 换算成「相对扫描根路径」的路径（解码一次，以 / 开头）；不在根路径下返回 null。
  *
- * 这里只做字符串换算，不抛异常：不安全名字（反斜杠 / .. / 控制字符）由
- * isUnsafeHref 判定，调用方负责跳过并计数，避免一条脏数据打断整次扫描。
+ * 这里只做字符串换算与一次宽松解码，永不抛：名字再怪也只影响它自己能否被请求，
+ * 不该中断整次列表/扫描。
  */
 export function hrefToRelativePath(href: string, rootUrl: string): string | null {
   const hrefPath = toPathKey(rawUrlPath(href));
@@ -344,6 +297,14 @@ export function createWebDavClient(options: WebDavClientOptions): WebDavClient {
     },
     urlFor(input) {
       return resolveUrl(rootUrl, input);
+    },
+    canRequest(input) {
+      try {
+        resolveUrl(rootUrl, input);
+        return true;
+      } catch {
+        return false;
+      }
     },
     async propfind(input = "/", depth = 1) {
       const url = client.urlFor(input);

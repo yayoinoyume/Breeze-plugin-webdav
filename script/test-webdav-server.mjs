@@ -101,6 +101,10 @@ export function createFixture(options = {}) {
   if (options.backslashEntry === true) {
     rootChildren["1\\2.png"] = file(makePngLike(8 * 1024, 61));
   }
+  if (options.percentNames === true) {
+    // 合法但带 % 的名字：根目录放 100%.png（解码文本里是字面 %）。
+    rootChildren["100%.png"] = file(makePngLike(9 * 1024, 64));
+  }
   const root = dir(rootChildren);
   // 脏名字条目：href 里会出现 %252e%252e / %5C / %255C 这些形式。
   const dirtyEntries = Array.isArray(options.dirtyEntries) ? options.dirtyEntries : [];
@@ -109,13 +113,21 @@ export function createFixture(options = {}) {
     const dirComic = comicsDir.children.get("目录漫画");
     for (const dirty of dirtyEntries) {
       if (dirty === "dots-dir") {
-        comicsDir.children.set("%2e%2e", dir({}));
+        // 真实目录名就是 %2e%2e（href %252e%252e）：合法名字，应能正常打开。
+        comicsDir.children.set("%2e%2e", dir({ "001.png": file(makePngLike(10 * 1024, 63)) }));
       } else if (dirty === "backslash-dir") {
         comicsDir.children.set("\\", dir({}));
       } else if (dirty === "percent-file") {
         dirComic.children.set("a%5Cb.png", file(makePngLike(4 * 1024, 62)));
       }
     }
+  }
+  if (options.percentNames === true) {
+    // 合法但带 % 的名字：目录 "50% off" 放一个 CBZ，目录名含中文/emoji。
+    const comicsDir = root.children.get("comics");
+    const percentCbz = zipSync({ "001.png": makePngLike(12 * 1024, 65) }, { level: 0 });
+    comicsDir.children.set("50% off", dir({ "整包2.cbz": file(percentCbz) }));
+    comicsDir.children.set("漫画 😀", dir({ "第 1 页.png": file(makePngLike(11 * 1024, 66)) }));
   }
 
   const files = new Map();
@@ -267,7 +279,8 @@ export async function startWebDavServer(options = {}) {
   const pass = options.pass ?? AUTH_PASS;
   const fixture = createFixture({
     backslashEntry: options.backslashEntry === true,
-    dirtyEntries: Array.isArray(options.dirtyEntries) ? options.dirtyEntries : []
+    dirtyEntries: Array.isArray(options.dirtyEntries) ? options.dirtyEntries : [],
+    percentNames: options.percentNames === true
   });
   const extraHrefs = Array.isArray(options.extraHrefs) ? options.extraHrefs : [];
   const requests = [];

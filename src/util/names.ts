@@ -71,15 +71,11 @@ export function isCbzFile(name: string): boolean {
   return lower.endsWith(".cbz") || lower.endsWith(".zip");
 }
 
-/** 去掉路径末尾斜杠，保证以 / 开头；根路径返回 "/"。 */
-export function normalizeDavPath(path: string): string {
+/** 只做字符串整理：补前导斜杠、折叠重复斜杠、去掉结尾斜杠。不做安全检查，永不抛。 */
+export function tidyDavPath(path: string): string {
   let value = String(path ?? "").trim();
   if (value === "") {
     return "/";
-  }
-  // 反斜杠：有些 WebDAV 服务器把它当目录分隔符，放过去就能绕过下面的 .. 检查。
-  if (value.includes("\\")) {
-    throw new Error("路径里不能包含反斜杠（服务器可能把它当成目录分隔符）");
   }
   if (!value.startsWith("/")) {
     value = "/" + value;
@@ -88,15 +84,25 @@ export function normalizeDavPath(path: string): string {
   if (value.length > 1) {
     value = value.replace(/\/+$/, "");
   }
-  if (value.split("/").some((segment) => segment === "..")) {
-    throw new Error("路径里不能包含 ..（上级目录）");
-  }
   return value === "" ? "/" : value;
 }
 
-/** 路径最后一段（目录路径不带结尾斜杠）。 */
+/** 整理路径并拒绝真实危险形态（字面反斜杠、.. 段）。只用于请求层与设置项。 */
+export function normalizeDavPath(path: string): string {
+  const value = tidyDavPath(path);
+  // 反斜杠：有些 WebDAV 服务器把它当目录分隔符，放过去就能绕过下面的 .. 检查。
+  if (value.includes("\\")) {
+    throw new Error("路径里不能包含反斜杠（服务器可能把它当成目录分隔符）");
+  }
+  if (value.split("/").some((segment) => segment === "..")) {
+    throw new Error("路径里不能包含 ..（上级目录）");
+  }
+  return value;
+}
+
+/** 路径最后一段（目录路径不带结尾斜杠）。永不抛：列表里出现什么样的名字都不该中断。 */
 export function baseName(path: string): string {
-  const value = normalizeDavPath(path);
+  const value = tidyDavPath(path);
   if (value === "/") {
     return "";
   }

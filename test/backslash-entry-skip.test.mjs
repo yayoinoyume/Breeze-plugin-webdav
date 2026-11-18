@@ -1,14 +1,9 @@
 /**
- * P1 回归：一条含反斜杠的文件名不能弄挂整个漫画库。
- *
- * 背景：请求层必须拒绝反斜杠路径（服务器可能把它当目录分隔符），
- * 但列目录时服务器完全可能返回这种名字的普通文件（href 编码成 1%5C2.png）。
- * 以前的实现让 normalizeDavPath 在 relativePath 里抛异常，一次扫描直接失败。
- *
- * 现在的行为：扫描与目录列图都会跳过这类条目并计数，其它条目照常返回，
- * warning 里带中文提示（复用 scanWarning 通道）。
+ * 名字里真有反斜杠的文件：列表层不判定、不中断；只有取这一页时才拒绝。
+ * 目录漫画列图时会跳过它并计数（详情/快照仍可用，warning 如实提示）。
  */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import "breeze-plugin-kit/node";
 import { authConfig } from "breeze-plugin-kit";
@@ -19,65 +14,14 @@ import {
   DAV_PREFIX,
   startWebDavServer
 } from "../script/test-webdav-server.mjs";
-import { hrefToRelativePath } from "../src/webdav/client.ts";
-import { scanComicsDetailed } from "../src/webdav/scan.ts";
 
-function davEntry(href, isCollection = false) {
-  return { href, isCollection, contentLength: null, lastModified: null };
+const BACKSLASH = String.fromCharCode(92);
+
+function sha256(bytes) {
+  return createHash("sha256").update(Buffer.from(bytes)).digest("hex");
 }
 
-async function saveSettings(keys, baseUrl) {
-  await authConfig.save(keys.baseUrl, baseUrl);
-  await authConfig.save(keys.username, AUTH_USER);
-  await authConfig.save(keys.password, AUTH_PASS);
-  await authConfig.save(keys.rootPath, "/");
-  await authConfig.save(keys.scanDepth, "2");
-  await authConfig.save(keys.maxComics, "300");
-  await authConfig.save(keys.includeCbz, "true");
-}
-
-test("backslash-entry-skip 扫描跳过含反斜杠的条目并计数，不抛异常", async () => {
-  const entries = [
-    davEntry("/dav/1%5C2.png"),
-    davEntry("/dav/a.png"),
-    davEntry("/dav/b%5Cc.png"),
-    davEntry("/dav/%252e%252e/", true),
-    davEntry("/dav/a%00b.png"),
-    davEntry("/dav/%zz.png"),
-    davEntry("/dav/sub/", true)
-  ];
-  const lister = {
-    async list() {
-      return entries;
-    },
-    relativePath(href) {
-      return hrefToRelativePath(href, "http://nas.local/dav");
-    }
-  };
-
-  const result = await scanComicsDetailed(lister, {
-    rootPath: "/",
-    scanDepth: 2,
-    includeCbz: true
-  });
-
-  assert.equal(
-    result.skippedEntries,
-    5,
-    "反斜杠 2 条 + 双重编码 .. 1 条 + NUL 1 条 + 坏编码 1 条都要计数"
-  );
-  assert.match(result.warning ?? "", /含反斜杠/, "warning 要说明反斜杠条目被跳过");
-  assert.match(result.warning ?? "", /可疑 \.\./, "warning 要说明可疑 .. 条目被跳过");
-  assert.match(result.warning ?? "", /有 5 个条目/, "warning 要带跳过计数");
-  assert.deepEqual(
-    result.comics.map((comic) => comic.path),
-    ["/"],
-    "其它条目照常扫描出漫画"
-  );
-  assert.equal(result.comics[0].coverImagePath, "/a.png", "封面只能取安全条目");
-});
-
-test("backslash-entry-skip 服务器返回 1%5C2.png 时列表/详情照常，warning 可见", async () => {
+test("backslash-entry-skip 含反斜杠的文件名不中断列表/详情/快照，只在取页时明确拒绝", async () => {
   const server = await startWebDavServer({
     user: AUTH_USER,
     pass: AUTH_PASS,
@@ -87,51 +31,61 @@ test("backslash-entry-skip 服务器返回 1%5C2.png 时列表/详情照常，wa
     installTestHost();
     const { SETTING_KEYS } = await import("../src/settings.ts");
     const comics = await import("../src/comics.ts");
-
-    await saveSettings(SETTING_KEYS, "http://127.0.0.1:" + server.port + "/dav");
+    await authConfig.save(SETTING_KEYS.baseUrl, "http://127.0.0.1:" + server.port + "/dav");
+    await authConfig.save(SETTING_KEYS.username, AUTH_USER);
+    await authConfig.save(SETTING_KEYS.password, AUTH_PASS);
+    await authConfig.save(SETTING_KEYS.rootPath, "/");
+    await authConfig.save(SETTING_KEYS.scanDepth, "2");
+    await authConfig.save(SETTING_KEYS.maxComics, "300");
+    await authConfig.save(SETTING_KEYS.includeCbz, "true");
     comics.clearScanCache();
 
     const list = await comics.getComicList({ page: 1 });
-    assert.ok(list.data.items.length > 0, "整库仍应返回其它漫画");
-    assert.match(
-      String(list.extern?.scanWarning ?? ""),
-      /含反斜杠/,
-      "列表 extern.scanWarning 要能看见跳过提示"
-    );
-    assert.match(String(list.extern?.scanWarning ?? ""), /有 1 个条目/, "skip 计数应为 1");
-    assert.ok(
-      !JSON.stringify(list.data.items).includes("\u005c"),
-      "列表里不能出现反斜杠路径"
-    );
-
     const rootItem = list.data.items.find((item) => item.extern?.path === "/");
-    assert.ok(rootItem, "根目录漫画仍应列出");
-    assert.ok(rootItem.cover.path !== "", "cover.path 不能为空");
-    assert.ok(!rootItem.cover.path.includes("\u005c"), "封面不能是含反斜杠的脏条目");
-    assert.notEqual(rootItem.cover.path, "/1\u005c2.png", "脏条目不能当封面");
+    assert.ok(rootItem, "根目录漫画仍应列出，列表不能因为一条脏名字中断");
+
+    const detail = await comics.getComicDetail({ comicId: rootItem.id, extern: {} });
     assert.ok(
-      server.fixture.files.has(DAV_PREFIX + rootItem.cover.path),
-      "封面必须指向 fixture 里真实存在的图"
+      !detail.data.normal.comicInfo.cover.path.includes(BACKSLASH),
+      "详情封面不能取含反斜杠的图"
+    );
+    assert.match(
+      String(detail.extern?.scanWarning ?? ""),
+      /有 1 个条目无法安全读取/,
+      "跳过的脏图片数要如实写进 warning"
     );
 
-    // 详情 / 快照要列目录取页：目录里混着 1%5C2.png 也不能抛。
     const snapshot = await comics.getReadSnapshot({ comicId: rootItem.id, extern: {} });
-    const pages = snapshot.data.chapter.pages;
-    assert.equal(pages.length, 3, "根目录 3 张正常图都应为页，脏条目被跳过");
+    assert.equal(snapshot.data.chapter.pages.length, 3, "3 张正常图仍应为页");
     assert.ok(
-      pages.every((page) => !page.path.includes("\u005c")),
-      "页面路径里不能出现反斜杠"
+      snapshot.data.chapter.pages.every((page) => !page.path.includes(BACKSLASH)),
+      "页列表里不能出现反斜杠路径"
     );
     assert.match(
       String(snapshot.extern?.scanWarning ?? ""),
-      /含反斜杠/,
-      "快照 extern 也要带 scanWarning"
+      /有 1 个条目无法安全读取/,
+      "快照也要带 warning"
     );
 
-    // 被跳过的图片不会被请求：没有任何请求路径带反斜杠。
+    const firstPage = snapshot.data.chapter.pages[0];
+    const expected = server.fixture.files.get(DAV_PREFIX + firstPage.path);
+    assert.ok(expected instanceof Uint8Array, "fixture 应有正常页：" + firstPage.path);
+    const bytes = await comics.fetchImageBytes({ url: firstPage.url, extern: firstPage.extern });
+    assert.equal(sha256(bytes), sha256(expected), "正常页字节应与 fixture 一致");
+
+    // 直接向脏页取图：只这一页失败，文案明确。
+    await assert.rejects(
+      () =>
+        comics.fetchImageBytes({
+          url: firstPage.url,
+          extern: { kind: "dir", path: "/", imagePath: "/1" + BACKSLASH + "2.png", index: 0 }
+        }),
+      /这一项的路径不安全，已跳过/
+    );
+
     assert.ok(
-      server.requests.every((request) => !request.path.includes("\u005c")),
-      "不能对含反斜杠的路径发请求"
+      server.requests.every((request) => !request.path.includes(BACKSLASH)),
+      "不能对反斜杠路径发请求"
     );
   } finally {
     await server.close();

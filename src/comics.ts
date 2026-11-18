@@ -29,12 +29,13 @@ import { PLUGIN_ID } from "./plugin-info.ts";
 import { withFriendlyErrors } from "./errors.ts";
 import { loadSettings } from "./settings.ts";
 import type { WebDavSettings } from "./settings.ts";
-import { createWebDavClient, isUnsafeHref } from "./webdav/client.ts";
+import { createWebDavClient } from "./webdav/client.ts";
 import type { WebDavClient } from "./webdav/client.ts";
 import { downloadFileBytes } from "./http/download.ts";
 import {
-  dirtyEntriesWarning,
+  isFatalListError,
   scanComicsDetailed,
+  skippedEntriesWarning,
   sortImagePaths
 } from "./webdav/scan.ts";
 import type { ComicEntry, ScanResult } from "./webdav/scan.ts";
@@ -42,11 +43,12 @@ import { decodeComicId, encodeComicId, encodePageUrl, parsePageUrl } from "./web
 import type { ComicKind } from "./webdav/ids.ts";
 import { extractZipEntry, listZipImages, readZipEntries } from "./zip/cbz.ts";
 import type { ZipEntry } from "./zip/cbz.ts";
+import type { DavEntry } from "./webdav/xml.ts";
 import {
   baseName,
   comicTitle,
   isImageFile,
-  normalizeDavPath
+  tidyDavPath
 } from "./util/names.ts";
 
 export const SEARCH_PAGE_SIZE = 20;
@@ -345,40 +347,72 @@ function isUnderDirectory(path: string, dir: string): boolean {
   return dir === "/" ? path.startsWith("/") : path.startsWith(dir + "/");
 }
 
+const UNSAFE_PATH_MESSAGE = "这一项的路径不安全，已跳过";
+
+function isAbsoluteUrl(value: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
+}
+
+/** 老测试桩里可能没有 canRequest：缺省视为可以，避免把能力判定变成硬依赖。 */
+function canClientRequest(client: WebDavClient, path: string): boolean {
+  return typeof client.canRequest === "function" ? client.canRequest(path) : true;
+}
+
+/** 打开某一本之前：路径发不出去就只让这一本失败，文案明确。 */
+function assertRequestable(client: WebDavClient, path: string): void {
+  if (!isAbsoluteUrl(path) && !canClientRequest(client, path)) {
+    throw new Error(UNSAFE_PATH_MESSAGE);
+  }
+}
+
 type DirImagesResult = {
   images: string[];
-  /** 名字不安全（反斜杠 / 可疑 .. / 控制字符）而被跳过的图片数。 */
+  /** 因路径不安全或单条读取失败而跳过的条目数。 */
   skipped: number;
+  /** 整个目录列不出来（网络/权限/路径不安全）。 */
+  listFailed: boolean;
 };
 
 async function listDirImagesDetailed(
   client: WebDavClient,
   comicPath: string
 ): Promise<DirImagesResult> {
-  const entries = await client.list(comicPath, 1);
+  let entries: DavEntry[];
+  try {
+    entries = await client.list(comicPath, 1);
+  } catch (error) {
+    // 认证/协议级错误照旧整体抛；其余局部失败只影响这一本。
+    if (isFatalListError(error)) {
+      throw error;
+    }
+    return { images: [], skipped: 1, listFailed: true };
+  }
   const images: string[] = [];
   let skipped = 0;
   for (const entry of entries) {
     if (entry.isCollection) {
       continue;
     }
-    // 先做不抛异常的根路径换算：根外条目静默忽略，不算跳过。
-    const relative = client.relativePath(entry.href);
+    let relative: string | null = null;
+    try {
+      relative = client.relativePath(entry.href);
+    } catch {
+      skipped += 1;
+      continue;
+    }
     if (relative === null || relative === "" || !isUnderDirectory(relative, comicPath)) {
       continue;
     }
-    // 不安全条目（请求层会拒绝）直接跳过，不要让一条脏数据弄挂整本漫画。
-    if (isUnsafeHref(entry.href)) {
-      if (isImageFile(relative)) {
-        skipped += 1;
-      }
+    // 单条路径发不出去（字面 .. / 反斜杠 / 控制字符）：跳过并计数，不弄挂整本漫画。
+    if (!canClientRequest(client, relative)) {
+      skipped += 1;
       continue;
     }
     if (isImageFile(relative)) {
       images.push(relative);
     }
   }
-  return { images: sortImagePaths(images), skipped };
+  return { images: sortImagePaths(images), skipped, listFailed: false };
 }
 
 async function listDirImages(client: WebDavClient, comicPath: string): Promise<string[]> {
@@ -459,9 +493,13 @@ export async function buildChapterWithPagesDetailed(
   client: WebDavClient,
   comic: ComicRef
 ): Promise<ChapterWithPagesResult> {
+  assertRequestable(client, comic.path);
   const summary = buildChapterSummary(comic);
   if (comic.kind === "dir") {
     const listed = await listDirImagesDetailed(client, comic.path);
+    if (listed.listFailed) {
+      throw new Error("这个目录读不了（列目录失败），已跳过");
+    }
     if (listed.images.length === 0) {
       throw new Error("这个目录里没有图片");
     }
@@ -501,14 +539,16 @@ export function resolveComicRef(comicId: unknown, extern: unknown): ComicRef {
   const idText = asText(comicId);
   const decoded = decodeComicId(idText);
   if (decoded !== null) {
-    return { kind: decoded.kind, path: normalizeDavPath(decoded.path) };
+    // id 里存的是解码文本；危险形态留到发请求前由 assertRequestable 判定，
+    // 这里只做字符串整理，避免「打开时」报成别的错误。
+    return { kind: decoded.kind, path: tidyDavPath(decoded.path) };
   }
   const map = asRecord(extern);
   const kind =
     map.kind === "cbz" ? "cbz" : map.kind === "dir" ? "dir" : null;
   const path = asText(map.path);
   if (kind !== null && path !== "") {
-    return { kind, path: normalizeDavPath(path) };
+    return { kind, path: tidyDavPath(path) };
   }
   // 完全没有 id 与「id 传了但解不开」是两种故障：后者说明宿主传的 id 已损坏，
   // 再报「缺少漫画 id」会把人引到错误方向。
@@ -530,8 +570,9 @@ export async function fetchPageBytes(
   if (rawComicPath === "") {
     throw new Error("图片地址无效");
   }
-  const isAbsolute = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawComicPath);
-  const comicPath = isAbsolute ? rawComicPath : normalizeDavPath(rawComicPath);
+  const isAbsolute = isAbsoluteUrl(rawComicPath);
+  const comicPath = isAbsolute ? rawComicPath : tidyDavPath(rawComicPath);
+  assertRequestable(client, comicPath);
   const declaredKind = asText(map.kind);
   const kind: ComicKind =
     declaredKind === "cbz" || declaredKind === "dir"
@@ -543,8 +584,8 @@ export async function fetchPageBytes(
 
   if (kind === "dir") {
     let imagePath = asText(map.imagePath);
-    if (imagePath !== "" && !/^[a-z][a-z0-9+.-]*:\/\//i.test(imagePath)) {
-      imagePath = normalizeDavPath(imagePath);
+    if (imagePath !== "" && !isAbsoluteUrl(imagePath)) {
+      imagePath = tidyDavPath(imagePath);
     }
     if (imagePath === "") {
       const images = await listDirImages(client, comicPath);
@@ -553,6 +594,7 @@ export async function fetchPageBytes(
     if (imagePath === "") {
       throw new Error("找不到这张图片");
     }
+    assertRequestable(client, imagePath);
     const response = await client.fetchBytes(imagePath);
     return response.bytes;
   }
@@ -660,6 +702,7 @@ export async function getComicDetail(
   return withFriendlyErrors(async () => {
     const { client } = await scanWithSettings();
     const comic = resolveComicRef(payload.comicId, payload.extern);
+    assertRequestable(client, comic.path);
     const title = comicTitle(comic.kind, comic.path);
 
     let cover: ImageItem;
@@ -667,6 +710,9 @@ export async function getComicDetail(
     if (comic.kind === "dir") {
       const listed = await listDirImagesDetailed(client, comic.path);
       skippedImages = listed.skipped;
+      if (listed.listFailed) {
+        throw new Error("这个目录读不了（列目录失败），已跳过");
+      }
       const images = listed.images;
       if (images.length === 0) {
         throw new Error("这个目录里没有图片");
@@ -685,7 +731,8 @@ export async function getComicDetail(
     // 冷启动直接进详情时没跑过扫描，lastScanWarning 是空的；
     // 用本次列目录的跳过计数补一条，保证 warning 看得到。
     const warning =
-      lastScanWarning ?? (skippedImages > 0 ? dirtyEntriesWarning(skippedImages) : null);
+      lastScanWarning ??
+      (skippedImages > 0 ? skippedEntriesWarning(skippedImages) : null);
 
     const chapter = buildChapterSummary(comic);
     const normal: ComicDetailNormal = {
@@ -758,8 +805,9 @@ export async function getReadSnapshot(
       asText(payload.comicId) || payload.chapterId,
       payload.extern
     );
+    assertRequestable(client, comic.path);
     const { chapter, skipped } = await buildChapterWithPagesDetailed(client, comic);
-    const warning = lastScanWarning ?? (skipped > 0 ? dirtyEntriesWarning(skipped) : null);
+    const warning = lastScanWarning ?? (skipped > 0 ? skippedEntriesWarning(skipped) : null);
     const title = comicTitle(comic.kind, comic.path);
     return {
       source: PLUGIN_ID,
@@ -788,8 +836,9 @@ export async function getChapter(payload: ChapterPayload = {}): Promise<ChapterC
       asText(payload.comicId) || payload.chapterId,
       payload.extern
     );
+    assertRequestable(client, comic.path);
     const { chapter, skipped } = await buildChapterWithPagesDetailed(client, comic);
-    const warning = lastScanWarning ?? (skipped > 0 ? dirtyEntriesWarning(skipped) : null);
+    const warning = lastScanWarning ?? (skipped > 0 ? skippedEntriesWarning(skipped) : null);
     const title = comicTitle(comic.kind, comic.path);
     return {
       source: PLUGIN_ID,

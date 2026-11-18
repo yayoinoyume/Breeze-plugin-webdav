@@ -9,7 +9,7 @@ export const PLUGIN_NAME = "WebDAV 漫画";
 /** 插件 id：随机 uuid v4，建仓时生成后固定，不要修改。 */
 export const PLUGIN_ID = "a7d0c1f4-5b2e-4c93-9d61-3f2b8e7a4c10";
 
-export const PLUGIN_VERSION = "0.1.1";
+export const PLUGIN_VERSION = "0.1.2";
 
 function buildFunctionEntries(): PluginFunctionItem[] {
   return [

@@ -77,6 +77,10 @@ export function normalizeDavPath(path: string): string {
   if (value === "") {
     return "/";
   }
+  // 反斜杠：有些 WebDAV 服务器把它当目录分隔符，放过去就能绕过下面的 .. 检查。
+  if (value.includes("\\")) {
+    throw new Error("路径里不能包含反斜杠（服务器可能把它当成目录分隔符）");
+  }
   if (!value.startsWith("/")) {
     value = "/" + value;
   }

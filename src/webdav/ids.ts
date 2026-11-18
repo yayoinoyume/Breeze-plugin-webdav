@@ -75,15 +75,11 @@ export function decodePathId(id: string): string {
   if (bytes === null) {
     return "";
   }
-  let text = "";
-  try {
-    // 不要传 fatal 选项：Breeze 的 QuickJS 运行时用 text-encoding polyfill
-    // 替换了 TextDecoder，它不支持 fatal 并在构造时直接抛异常，会把所有 id 吞成空串。
-    // 非法 UTF-8 由下面 text.includes("\uFFFD") 的检查拒绝。
-    text = new TextDecoder("utf-8").decode(bytes);
-  } catch {
-    return "";
-  }
+  // 不要传 fatal 选项：Breeze 的 QuickJS 运行时用 text-encoding polyfill
+  // 替换了 TextDecoder，它不支持 fatal 并在构造时直接抛异常。
+  // 这里也不 catch：真出异常要暴露出来，不能静默吞成空串（否则「id 损坏」会伪装成「没传 id」）。
+  // 非法 UTF-8 由下面 text.includes("\uFFFD") 的检查拒绝。
+  const text = new TextDecoder("utf-8").decode(bytes);
   if (text === "" || text.includes("\uFFFD")) {
     return "";
   }

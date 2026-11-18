@@ -16,33 +16,7 @@ import {
   DAV_PREFIX,
   startWebDavServer
 } from "../script/test-webdav-server.mjs";
-
-const NativeTextDecoder = globalThis.TextDecoder;
-
-class PolyfillTextDecoder {
-  constructor(label = "utf-8", options) {
-    if (options !== undefined && options !== null && options.fatal === true) {
-      throw new TypeError("TextDecoder: the fatal option is not supported");
-    }
-    this._inner = new NativeTextDecoder(label);
-  }
-
-  get encoding() {
-    return this._inner.encoding;
-  }
-
-  get fatal() {
-    return this._inner.fatal;
-  }
-
-  get ignoreBOM() {
-    return this._inner.ignoreBOM;
-  }
-
-  decode(input, options) {
-    return this._inner.decode(input, options);
-  }
-}
+import { installPolyfillTextDecoder } from "./support/polyfill-textdecoder.mjs";
 
 function sha256(bytes) {
   return createHash("sha256").update(Buffer.from(bytes)).digest("hex");
@@ -58,9 +32,9 @@ async function saveSettings(keys, baseUrl) {
   await authConfig.save(keys.includeCbz, "true");
 }
 
-test("id-without-extern：只传列表 id / 只传 cover.url 也能打开详情与取封面", async () => {
+test("id-without-extern + cover-url-direct：只传列表 id / 列表项 cover.url 也能打开详情与取封面", async () => {
   const server = await startWebDavServer({ user: AUTH_USER, pass: AUTH_PASS });
-  globalThis.TextDecoder = PolyfillTextDecoder;
+  const restore = installPolyfillTextDecoder();
   try {
     installTestHost();
     const { SETTING_KEYS } = await import("../src/settings.ts");
@@ -78,6 +52,28 @@ test("id-without-extern：只传列表 id / 只传 cover.url 也能打开详情�
     );
     assert.ok(dirItem, "列表里应有根目录漫画");
     assert.ok(cbzItem, "列表里应有 /合集.cbz");
+
+    // 列表项形状：cover 是对象（不是字符串 url），metadata 是数组。
+    for (const item of [dirItem, cbzItem]) {
+      assert.equal(typeof item.cover, "object", "列表项 cover 应是对象：" + item.id);
+      assert.ok(item.cover !== null && !Array.isArray(item.cover), "列表项 cover 不是数组：" + item.id);
+      assert.match(item.cover.url, /^wdav:\/\//, "列表项 cover.url 应是 wdav 占位地址：" + item.id);
+      assert.ok(Array.isArray(item.metadata), "列表项 metadata 应是数组：" + item.id);
+    }
+
+    // cover-url-direct：直接用列表项的 cover.url 取图，extern 传空对象（宿主就是这么回调的）。
+    const dirListCoverBytes = await comics.fetchImageBytes({ url: dirItem.cover.url, extern: {} });
+    const dirListCoverExpected = server.fixture.files.get(DAV_PREFIX + dirItem.cover.path);
+    assert.ok(
+      dirListCoverExpected instanceof Uint8Array,
+      "fixture 应有列表封面图：" + dirItem.cover.path
+    );
+    assert.equal(sha256(dirListCoverBytes), sha256(dirListCoverExpected));
+
+    const cbzListCoverBytes = await comics.fetchImageBytes({ url: cbzItem.cover.url, extern: {} });
+    const cbzListCoverExpected = unzipSync(server.fixture.cbz)["001.png"];
+    assert.ok(cbzListCoverExpected instanceof Uint8Array, "fixture CBZ 应有 001.png");
+    assert.equal(sha256(cbzListCoverBytes), sha256(cbzListCoverExpected));
 
     // 详情只给列表项 id，extern 是空对象（宿主会丢掉列表项的 extern）。
     const dirDetail = await comics.getComicDetail({ comicId: dirItem.id, extern: {} });
@@ -104,7 +100,7 @@ test("id-without-extern：只传列表 id / 只传 cover.url 也能打开详情�
     assert.equal(cbzBytes.length, expectedFirst.length);
     assert.equal(sha256(cbzBytes), sha256(expectedFirst));
   } finally {
-    globalThis.TextDecoder = NativeTextDecoder;
+    restore();
     await server.close();
   }
 });

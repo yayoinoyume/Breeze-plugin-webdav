@@ -63,11 +63,19 @@ export function encodePath(path: string): string {
     .join("/");
 }
 
-/** 拒绝路径里的 .. 段（含百分号编码形式），绝对 URL 与相对路径都要过。 */
+/** 拒绝路径里的 .. 段与反斜杠（均含百分号编码形式），绝对 URL 与相对路径都要过。 */
 function assertNoTraversalPath(path: string, context: string): void {
-  for (const segment of String(path ?? "").split("/")) {
-    if (decodePercentSafe(segment) === "..") {
-      throw new Error(context + "里不能包含 ..（上级目录）");
+  for (const rawSegment of String(path ?? "").split("/")) {
+    const segment = decodePercentSafe(rawSegment);
+    // 反斜杠：某些服务器把它当目录分隔符，/..\..\secret 会越出 rootPath。
+    if (segment.includes("\\")) {
+      throw new Error(context + "里不能包含反斜杠（服务器可能把它当成目录分隔符）");
+    }
+    // %2F 解码后可能再生出新的分段，逐个再查一遍。
+    for (const sub of segment.split("/")) {
+      if (sub === "..") {
+        throw new Error(context + "里不能包含 ..（上级目录）");
+      }
     }
   }
 }

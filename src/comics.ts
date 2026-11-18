@@ -2,7 +2,7 @@
  * 插件业务层：搜索 / 详情 / 阅读快照 / 取图。
  *
  * 封面与页面都用 wdav:// 占位 url，真正的字节由 fetchImageBytes 按 extern 定位。
- * 目录漫画每次按需 PROPFIND；CBZ 整包下载后放模块内 LRU（最多 2 个包）。
+ * 目录漫画每次按需 PROPFIND；CBZ 整包下载后放模块内 LRU（按 256 MiB 总字节预算逐出）。
  */
 
 import type {
@@ -444,7 +444,8 @@ export async function buildChapterWithPages(
 
 /** 由 comicId / extern 解析漫画引用。 */
 export function resolveComicRef(comicId: unknown, extern: unknown): ComicRef {
-  const decoded = decodeComicId(asText(comicId));
+  const idText = asText(comicId);
+  const decoded = decodeComicId(idText);
   if (decoded !== null) {
     return { kind: decoded.kind, path: normalizeDavPath(decoded.path) };
   }
@@ -454,6 +455,11 @@ export function resolveComicRef(comicId: unknown, extern: unknown): ComicRef {
   const path = asText(map.path);
   if (kind !== null && path !== "") {
     return { kind, path: normalizeDavPath(path) };
+  }
+  // 完全没有 id 与「id 传了但解不开」是两种故障：后者说明宿主传的 id 已损坏，
+  // 再报「缺少漫画 id」会把人引到错误方向。
+  if (idText !== "") {
+    throw new Error("漫画 id 格式无效（可能已损坏）");
   }
   throw new Error("缺少漫画 id，无法打开");
 }

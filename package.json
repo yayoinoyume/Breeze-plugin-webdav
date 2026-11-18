@@ -1,0 +1,27 @@
+{
+  "name": "breeze-plugin-webdav",
+  "version": "0.1.0",
+  "description": "Breeze WebDAV 漫画源插件",
+  "type": "module",
+  "packageManager": "pnpm@12.16.1",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "manifest": "node build/generate-manifest.mjs",
+    "build": "pnpm typecheck && node build/generate-manifest.mjs && rspack build",
+    "test": "pnpm build && node --test test/",
+    "e2e": "node script/e2e-webdav.mjs"
+  },
+  "dependencies": {
+    "breeze-plugin-kit": "^0.22.0",
+    "fflate": "^0.8.3"
+  },
+  "devDependencies": {
+    "@rspack/cli": "^2.3.3",
+    "@rspack/core": "^2.3.3",
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2"
+  }
+}

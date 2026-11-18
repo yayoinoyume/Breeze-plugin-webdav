@@ -58,6 +58,10 @@ test("id-without-extern + cover-url-direct：只传列表 id / 列表项 cover.u
       assert.equal(typeof item.cover, "object", "列表项 cover 应是对象：" + item.id);
       assert.ok(item.cover !== null && !Array.isArray(item.cover), "列表项 cover 不是数组：" + item.id);
       assert.match(item.cover.url, /^wdav:\/\//, "列表项 cover.url 应是 wdav 占位地址：" + item.id);
+      assert.ok(
+        typeof item.cover.path === "string" && item.cover.path !== "",
+        "列表项 cover.path 不能为空（宿主会直接 404）：" + item.id
+      );
       assert.ok(Array.isArray(item.metadata), "列表项 metadata 应是数组：" + item.id);
     }
 

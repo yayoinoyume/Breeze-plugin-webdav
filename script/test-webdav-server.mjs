@@ -43,8 +43,12 @@ function file(bytes) {
   return { type: "file", bytes };
 }
 
-/** 生成 fixture：3 张图 + 1 个子目录 2 张图 + 1 个 >8MiB 的 CBZ。 */
-export function createFixture() {
+/**
+ * 生成 fixture：3 张图 + 1 个子目录 2 张图 + 1 个 >8MiB 的 CBZ。
+ * options.backslashEntry=true 时在根目录多放一个名含反斜杠的图（href 会编码成 1%5C2.png），
+ * 用来验证扫描跳过脏条目而不是整库报错。
+ */
+export function createFixture(options = {}) {
   const page1 = makePngLike(320 * 1024, 1);
   const page2 = makePngLike(400 * 1024, 2);
   const page3 = makePngLike(288 * 1024, 3);
@@ -73,7 +77,7 @@ export function createFixture() {
     { level: 0 }
   );
 
-  const root = dir({
+  const rootChildren = {
     "第 01 页.png": file(page1),
     "page-02.png": file(page2),
     "page 03.png": file(page3),
@@ -93,7 +97,11 @@ export function createFixture() {
       }),
       "整包.cbz": file(comicsCbz)
     })
-  });
+  };
+  if (options.backslashEntry === true) {
+    rootChildren["1\\2.png"] = file(makePngLike(8 * 1024, 61));
+  }
+  const root = dir(rootChildren);
 
   const files = new Map();
   const walk = (node, relative) => {
@@ -225,7 +233,9 @@ function contentTypeOf(path) {
 export async function startWebDavServer(options = {}) {
   const user = options.user ?? AUTH_USER;
   const pass = options.pass ?? AUTH_PASS;
-  const fixture = createFixture();
+  const fixture = createFixture({
+    backslashEntry: options.backslashEntry === true
+  });
   const requests = [];
 
   const server = createServer((req, res) => {

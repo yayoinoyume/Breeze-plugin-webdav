@@ -3,7 +3,9 @@
  *
  * 真实实现来自 text-encoding polyfill：
  *   - 构造函数对任意 truthy 的 options.fatal 直接抛 Error（不是 TypeError）；
- *   - decode 对任意 truthy 的 options.stream 直接抛 Error。
+ *   - decode 对任意 truthy 的 options.stream 直接抛 Error；
+ *   - 解码保留开头的 BOM（实测真 polyfill 返回 "\uFEFFA" 而不是 "A"）。
+ *     Node 原生 TextDecoder 默认剥 BOM，所以内层必须传 ignoreBOM: true 才等价。
  * Node 原生 TextDecoder 两个选项都支持，所以只有装上这个替身，
  * 本机测试才能复现「真机 polyfill 行为」与 Node 的差异。
  *
@@ -19,7 +21,8 @@ export class PolyfillTextDecoder {
     if (options !== undefined && options !== null && options.fatal) {
       throw new Error('The "fatal" option is not supported by the text-encoding polyfill');
     }
-    this._inner = new NativeTextDecoder(label);
+    // ignoreBOM: true = 保留 BOM，对齐真 polyfill（Node 默认会剥掉）。
+    this._inner = new NativeTextDecoder(label, { ignoreBOM: true });
   }
 
   get encoding() {

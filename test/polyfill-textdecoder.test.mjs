@@ -41,6 +41,11 @@ test("polyfill-shim-equivalence 替身与 Breeze 的 text-encoding polyfill 一�
     new PolyfillTextDecoder("utf-8").decode(Uint8Array.from([0xe6, 0xbc, 0xab])),
     "漫"
   );
+  // BOM：真 polyfill 保留开头 BOM（实测 "\uFEFFA"），替身用 ignoreBOM:true 对齐。
+  assert.equal(
+    new PolyfillTextDecoder("utf-8").decode(Uint8Array.from([0xef, 0xbb, 0xbf, 0x41])),
+    "\uFEFFA"
+  );
 });
 
 test("polyfill-textdecoder：宿主 TextDecoder 拒绝 fatal 时 id 与页面 url 仍可往返", async () => {

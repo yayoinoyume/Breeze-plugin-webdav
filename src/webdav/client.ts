@@ -63,18 +63,26 @@ export function encodePath(path: string): string {
     .join("/");
 }
 
-/** 拒绝路径里的 .. 段与反斜杠（均含百分号编码形式），绝对 URL 与相对路径都要过。 */
+/**
+ * 拒绝路径里的 .. 段与反斜杠（单重与双重百分号编码都要拦），绝对 URL 与相对路径都要过。
+ *
+ * 为什么解码两次：内部路径里若出现字面 "%5C" / "%2e%2e"，编码上线后会变成
+ * %255C / %252e%252e；只解一次看不出危险，但会二次解码的服务器仍可能越界。
+ * 这里按「解码一次」和「解码两次」的结果分别检查，宁可拒绝一个合法文件名也不错放越界。
+ */
 function assertNoTraversalPath(path: string, context: string): void {
   for (const rawSegment of String(path ?? "").split("/")) {
-    const segment = decodePercentSafe(rawSegment);
-    // 反斜杠：某些服务器把它当目录分隔符，/..\..\secret 会越出 rootPath。
-    if (segment.includes("\\")) {
-      throw new Error(context + "里不能包含反斜杠（服务器可能把它当成目录分隔符）");
-    }
-    // %2F 解码后可能再生出新的分段，逐个再查一遍。
-    for (const sub of segment.split("/")) {
-      if (sub === "..") {
-        throw new Error(context + "里不能包含 ..（上级目录）");
+    const decodedOnce = decodePercentSafe(rawSegment);
+    for (const segment of [decodedOnce, decodePercentSafe(decodedOnce)]) {
+      // 反斜杠：某些服务器把它当目录分隔符，/..\..\secret 会越出 rootPath。
+      if (segment.includes("\\")) {
+        throw new Error(context + "里不能包含反斜杠（服务器可能把它当成目录分隔符）");
+      }
+      // %2F 解码后可能再生出新的分段，逐个再查一遍。
+      for (const sub of segment.split("/")) {
+        if (sub === "..") {
+          throw new Error(context + "里不能包含 ..（上级目录）");
+        }
       }
     }
   }
@@ -226,9 +234,23 @@ function rawUrlPath(value: string): string {
   return path;
 }
 
-/** 把 href 换算成「相对扫描根路径」的路径（已解码，以 / 开头）。 */
+/**
+ * href 的路径部分解码一次后是否含反斜杠。
+ *
+ * 这类条目不能进内部路径（请求层会拒绝），但列目录时也不能让一条脏数据
+ * 弄挂整次扫描：调用方跳过它并计数，不要抛异常。
+ */
+export function hrefHasBackslash(href: string): boolean {
+  return decodePercentSafe(rawUrlPath(href)).includes("\\");
+}
+
+/** 把 href 换算成「相对扫描根路径」的路径（已解码，以 / 开头）；不安全条目返回 null。 */
 export function hrefToRelativePath(href: string, rootUrl: string): string | null {
   const hrefPath = toPathKey(rawUrlPath(href));
+  // 反斜杠条目由调用方跳过并计数（见 hrefHasBackslash），这里不抛异常。
+  if (hrefPath.includes("\\")) {
+    return null;
+  }
   const rootPath = toPathKey(rawUrlPath(rootUrl));
   if (hrefPath === rootPath) {
     return "/";

@@ -48,6 +48,10 @@ test("backslash-traversal 反斜杠路径一律拒绝，且不发请求", async 
     /反斜杠/
   );
 
+  // 双重编码防御：%255C 解码一次是 %5C、两次才是 \；%252e%252e 两次才是 ..。
+  assert.throws(() => client.urlFor("/..%255C..%255Csecret"), /反斜杠/);
+  assert.throws(() => client.urlFor("/%252e%252e/secret"), /不能包含 \.\./);
+
   // 走完整链路（PROPFIND）也必须先抛，请求数为 0。
   await assert.rejects(() => client.list("/..%5C..%5Csecret"), /反斜杠/);
   await assert.rejects(() => client.propfind("/..\\..\\secret"), /反斜杠/);

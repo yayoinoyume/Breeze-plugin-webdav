@@ -29,7 +29,7 @@ import { PLUGIN_ID } from "./plugin-info.ts";
 import { withFriendlyErrors } from "./errors.ts";
 import { loadSettings } from "./settings.ts";
 import type { WebDavSettings } from "./settings.ts";
-import { createWebDavClient } from "./webdav/client.ts";
+import { createWebDavClient, hrefHasBackslash } from "./webdav/client.ts";
 import type { WebDavClient } from "./webdav/client.ts";
 import { downloadFileBytes } from "./http/download.ts";
 import { scanComicsDetailed, sortImagePaths } from "./webdav/scan.ts";
@@ -341,6 +341,10 @@ async function listDirImages(client: WebDavClient, comicPath: string): Promise<s
   const images: string[] = [];
   for (const entry of entries) {
     if (entry.isCollection) {
+      continue;
+    }
+    // 含反斜杠的条目在请求层会被拒绝，这里直接跳过，不要让一条脏数据弄挂整本漫画。
+    if (hrefHasBackslash(entry.href)) {
       continue;
     }
     const relative = client.relativePath(entry.href);

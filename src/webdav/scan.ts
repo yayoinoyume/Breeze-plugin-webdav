@@ -6,9 +6,12 @@
  * - includeCbz 时 .cbz/.zip 文件各自是一本漫画；
  * - 没有图片的目录继续向下，层级最多到 scanDepth（根为第 0 层）；
  * - 总数最多 maxComics 本；列目录请求最多 maxListCalls 次。
+ * - href 含反斜杠的条目跳过并计数（服务器可能把它当目录分隔符，请求层禁止这类路径），
+ *   跳过情况通过 warning 上报，不能让一条脏数据弄挂整次扫描。
  */
 
 import type { DavEntry } from "./xml.ts";
+import { hrefHasBackslash } from "./client.ts";
 import {
   baseName,
   comicTitle,
@@ -50,9 +53,11 @@ export type ScanOptions = {
 
 export type ScanResult = {
   comics: ComicEntry[];
-  /** 达到列目录上限时的中文提示，否则 null。 */
+  /** 扫描提示（跳过不安全条目 / 列目录上限），没有则为 null。 */
   warning: string | null;
   listCalls: number;
+  /** 因路径含反斜杠而跳过的条目数（服务器可能把它当目录分隔符）。 */
+  skippedEntries: number;
 };
 
 function clampInt(value: number | undefined, fallback: number, min: number, max: number): number {
@@ -65,6 +70,14 @@ function clampInt(value: number | undefined, fallback: number, min: number, max:
 
 function budgetWarning(limit: number): string {
   return "目录太多，扫描已在上限 " + limit + " 次列目录请求处停止，结果可能不完整";
+}
+
+function backslashWarning(count: number): string {
+  return (
+    "有 " +
+    count +
+    " 个条目路径含反斜杠（服务器可能把它当目录分隔符），已跳过这些条目"
+  );
 }
 
 /** 扫描漫画列表，同时报告列目录预算与警告。 */
@@ -83,6 +96,7 @@ export async function scanComicsDetailed(
   const seen = new Set<string>();
   let listCalls = 0;
   let budgetStopped = false;
+  let skippedEntries = 0;
 
   while (queue.length > 0 && comics.length < maxComics) {
     if (listCalls >= maxListCalls) {
@@ -98,6 +112,11 @@ export async function scanComicsDetailed(
     const entries = await lister.list(current.path, 1);
     const children: Array<{ entry: DavEntry; path: string }> = [];
     for (const entry of entries) {
+      // 一条含反斜杠的脏条目不能弄挂整次扫描：跳过并计数，最后并进 warning。
+      if (hrefHasBackslash(entry.href)) {
+        skippedEntries += 1;
+        continue;
+      }
       const relative = lister.relativePath(entry.href);
       if (relative === null || relative === "" || relative === current.path) {
         continue;
@@ -149,12 +168,21 @@ export async function scanComicsDetailed(
     }
   }
 
+  const warnings: string[] = [];
+  if (skippedEntries > 0) {
+    warnings.push(backslashWarning(skippedEntries));
+  }
+  if (budgetStopped) {
+    warnings.push(budgetWarning(maxListCalls));
+  }
+
   return {
     comics: comics
       .slice(0, maxComics)
       .sort((left, right) => naturalCompare(left.path, right.path)),
-    warning: budgetStopped ? budgetWarning(maxListCalls) : null,
-    listCalls
+    warning: warnings.length === 0 ? null : warnings.join("；"),
+    listCalls,
+    skippedEntries
   };
 }
 

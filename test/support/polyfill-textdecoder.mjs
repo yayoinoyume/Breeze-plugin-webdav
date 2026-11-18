@@ -3,9 +3,12 @@
  *
  * 真实实现来自 text-encoding polyfill：
  *   - 构造函数对任意 truthy 的 options.fatal 直接抛 Error（不是 TypeError）；
- *   - decode 对任意 truthy 的 options.stream 直接抛 Error；
- *   - 解码保留开头的 BOM（实测真 polyfill 返回 "\uFEFFA" 而不是 "A"）。
- *     Node 原生 TextDecoder 默认剥 BOM，所以内层必须传 ignoreBOM: true 才等价。
+ *   - decode 对任意 truthy 的 options.stream 直接抛 Error。
+ *
+ * BOM 行为不做断言：Breeze 自带的 polyfill 源码（04_runtime_base_polyfills.js）
+ * 不在本工作区，无法核实。可核实的参照是 npm text-encoding@0.7.0
+ * lib/encoding.js:1176-1186：ignoreBOM 未设置时默认剥掉开头 BOM，
+ * 与 Node 原生 TextDecoder 默认一致，所以替身直接用原生默认。
  * Node 原生 TextDecoder 两个选项都支持，所以只有装上这个替身，
  * 本机测试才能复现「真机 polyfill 行为」与 Node 的差异。
  *
@@ -21,8 +24,7 @@ export class PolyfillTextDecoder {
     if (options !== undefined && options !== null && options.fatal) {
       throw new Error('The "fatal" option is not supported by the text-encoding polyfill');
     }
-    // ignoreBOM: true = 保留 BOM，对齐真 polyfill（Node 默认会剥掉）。
-    this._inner = new NativeTextDecoder(label, { ignoreBOM: true });
+    this._inner = new NativeTextDecoder(label);
   }
 
   get encoding() {

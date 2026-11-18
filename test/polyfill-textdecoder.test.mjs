@@ -41,11 +41,8 @@ test("polyfill-shim-equivalence 替身与 Breeze 的 text-encoding polyfill 一�
     new PolyfillTextDecoder("utf-8").decode(Uint8Array.from([0xe6, 0xbc, 0xab])),
     "漫"
   );
-  // BOM：真 polyfill 保留开头 BOM（实测 "\uFEFFA"），替身用 ignoreBOM:true 对齐。
-  assert.equal(
-    new PolyfillTextDecoder("utf-8").decode(Uint8Array.from([0xef, 0xbb, 0xbf, 0x41])),
-    "\uFEFFA"
-  );
+  // 说明：BOM 行为不再断言——Breeze 自带 polyfill 源码不在本工作区，无法核实；
+  // 可核实的 npm text-encoding@0.7.0 lib/encoding.js:1176-1186 与 Node 默认一致（剥 BOM）。
 });
 
 test("polyfill-textdecoder：宿主 TextDecoder 拒绝 fatal 时 id 与页面 url 仍可往返", async () => {

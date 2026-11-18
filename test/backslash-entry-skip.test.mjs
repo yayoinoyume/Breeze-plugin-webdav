@@ -41,6 +41,9 @@ test("backslash-entry-skip 扫描跳过含反斜杠的条目并计数，不抛�
     davEntry("/dav/1%5C2.png"),
     davEntry("/dav/a.png"),
     davEntry("/dav/b%5Cc.png"),
+    davEntry("/dav/%252e%252e/", true),
+    davEntry("/dav/a%00b.png"),
+    davEntry("/dav/%zz.png"),
     davEntry("/dav/sub/", true)
   ];
   const lister = {
@@ -58,9 +61,14 @@ test("backslash-entry-skip 扫描跳过含反斜杠的条目并计数，不抛�
     includeCbz: true
   });
 
-  assert.equal(result.skippedEntries, 2, "两条含反斜杠的条目都要计数");
+  assert.equal(
+    result.skippedEntries,
+    5,
+    "反斜杠 2 条 + 双重编码 .. 1 条 + NUL 1 条 + 坏编码 1 条都要计数"
+  );
   assert.match(result.warning ?? "", /含反斜杠/, "warning 要说明反斜杠条目被跳过");
-  assert.match(result.warning ?? "", /有 2 个条目/, "warning 要带跳过计数");
+  assert.match(result.warning ?? "", /可疑 \.\./, "warning 要说明可疑 .. 条目被跳过");
+  assert.match(result.warning ?? "", /有 5 个条目/, "warning 要带跳过计数");
   assert.deepEqual(
     result.comics.map((comic) => comic.path),
     ["/"],

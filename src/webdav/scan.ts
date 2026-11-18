@@ -6,12 +6,12 @@
  * - includeCbz 时 .cbz/.zip 文件各自是一本漫画；
  * - 没有图片的目录继续向下，层级最多到 scanDepth（根为第 0 层）；
  * - 总数最多 maxComics 本；列目录请求最多 maxListCalls 次。
- * - href 含反斜杠的条目跳过并计数（服务器可能把它当目录分隔符，请求层禁止这类路径），
- *   跳过情况通过 warning 上报，不能让一条脏数据弄挂整次扫描。
+ * - 列目录时遇到名字不安全的条目（反斜杠 / 可疑 .. / 控制字符，判定见 isUnsafeHref），
+ *   在 rootPath 内的跳过并计数，通过 warning 上报；绝不能让一条脏数据弄挂整次扫描。
  */
 
 import type { DavEntry } from "./xml.ts";
-import { hrefHasBackslash } from "./client.ts";
+import { isUnsafeHref } from "./client.ts";
 import {
   baseName,
   comicTitle,
@@ -60,6 +60,14 @@ export type ScanResult = {
   skippedEntries: number;
 };
 
+/** path 是否在 rootPath 内（含 rootPath 自身）。 */
+function isWithinRootPath(path: string, rootPath: string): boolean {
+  if (rootPath === "/") {
+    return path.startsWith("/");
+  }
+  return path === rootPath || path.startsWith(rootPath + "/");
+}
+
 function clampInt(value: number | undefined, fallback: number, min: number, max: number): number {
   const number = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(number)) {
@@ -72,11 +80,12 @@ function budgetWarning(limit: number): string {
   return "目录太多，扫描已在上限 " + limit + " 次列目录请求处停止，结果可能不完整";
 }
 
-function backslashWarning(count: number): string {
+/** 列目录时跳过脏条目的中文提示（带数量）。 */
+export function dirtyEntriesWarning(count: number): string {
   return (
     "有 " +
     count +
-    " 个条目路径含反斜杠（服务器可能把它当目录分隔符），已跳过这些条目"
+    " 个条目名字含反斜杠或可疑 ..（服务器可能把它当目录分隔符），已跳过这些条目"
   );
 }
 
@@ -112,13 +121,21 @@ export async function scanComicsDetailed(
     const entries = await lister.list(current.path, 1);
     const children: Array<{ entry: DavEntry; path: string }> = [];
     for (const entry of entries) {
-      // 一条含反斜杠的脏条目不能弄挂整次扫描：跳过并计数，最后并进 warning。
-      if (hrefHasBackslash(entry.href)) {
-        skippedEntries += 1;
-        continue;
-      }
       const relative = lister.relativePath(entry.href);
       if (relative === null || relative === "" || relative === current.path) {
+        // 根路径外或自身条目：静默跳过，不算进 warning 的跳过计数。
+        continue;
+      }
+      if (!isWithinRootPath(relative, rootPath)) {
+        // 不在设置的 rootPath 下（例如服务器多返回了别处的条目）：静默忽略。
+        continue;
+      }
+      if (isUnsafeHref(entry.href)) {
+        // 一条脏条目不能弄挂整次扫描：跳过并计数。
+        // 只统计「本来会进结果集」的条目（目录 / 图片 / CBZ），普通文件不算。
+        if (entry.isCollection || isImageFile(relative) || (includeCbz && isCbzFile(relative))) {
+          skippedEntries += 1;
+        }
         continue;
       }
       children.push({ entry, path: relative });
@@ -170,7 +187,7 @@ export async function scanComicsDetailed(
 
   const warnings: string[] = [];
   if (skippedEntries > 0) {
-    warnings.push(backslashWarning(skippedEntries));
+    warnings.push(dirtyEntriesWarning(skippedEntries));
   }
   if (budgetStopped) {
     warnings.push(budgetWarning(maxListCalls));

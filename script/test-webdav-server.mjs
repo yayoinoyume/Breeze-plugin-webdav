@@ -102,6 +102,21 @@ export function createFixture(options = {}) {
     rootChildren["1\\2.png"] = file(makePngLike(8 * 1024, 61));
   }
   const root = dir(rootChildren);
+  // 脏名字条目：href 里会出现 %252e%252e / %5C / %255C 这些形式。
+  const dirtyEntries = Array.isArray(options.dirtyEntries) ? options.dirtyEntries : [];
+  if (dirtyEntries.length > 0) {
+    const comicsDir = root.children.get("comics");
+    const dirComic = comicsDir.children.get("目录漫画");
+    for (const dirty of dirtyEntries) {
+      if (dirty === "dots-dir") {
+        comicsDir.children.set("%2e%2e", dir({}));
+      } else if (dirty === "backslash-dir") {
+        comicsDir.children.set("\\", dir({}));
+      } else if (dirty === "percent-file") {
+        dirComic.children.set("a%5Cb.png", file(makePngLike(4 * 1024, 62)));
+      }
+    }
+  }
 
   const files = new Map();
   const walk = (node, relative) => {
@@ -158,7 +173,7 @@ function escapeXml(text) {
     .replace(/"/g, "&quot;");
 }
 
-function propfindResponseXml(relativePath, node, depth) {
+function propfindResponseXml(relativePath, node, depth, extraHrefs = []) {
   const items = [];
 
   const pushItem = (path, current) => {
@@ -189,6 +204,23 @@ function propfindResponseXml(relativePath, node, depth) {
   };
 
   walk(relativePath, node, depth);
+
+  // 注入根路径外的 href：用来验证「根外条目不计入跳过数、不触发 warning」。
+  for (const extra of extraHrefs) {
+    const isCollection = extra.isCollection === true;
+    const lastSegment = String(extra.href).split("/").filter((segment) => segment !== "").pop() ?? "";
+    items.push(
+      "<D:response>" +
+        "<D:href>" + escapeXml(extra.href) + "</D:href>" +
+        "<D:propstat><D:prop>" +
+        "<D:displayname>" + escapeXml(lastSegment) + "</D:displayname>" +
+        "<D:resourcetype>" + (isCollection ? "<D:collection/>" : "") + "</D:resourcetype>" +
+        "<D:getcontentlength>16</D:getcontentlength>" +
+        "<D:getlastmodified>" + LAST_MODIFIED + "</D:getlastmodified>" +
+        "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>" +
+        "</D:response>"
+    );
+  }
 
   return (
     '<?xml version="1.0" encoding="utf-8"?>' +
@@ -234,8 +266,10 @@ export async function startWebDavServer(options = {}) {
   const user = options.user ?? AUTH_USER;
   const pass = options.pass ?? AUTH_PASS;
   const fixture = createFixture({
-    backslashEntry: options.backslashEntry === true
+    backslashEntry: options.backslashEntry === true,
+    dirtyEntries: Array.isArray(options.dirtyEntries) ? options.dirtyEntries : []
   });
+  const extraHrefs = Array.isArray(options.extraHrefs) ? options.extraHrefs : [];
   const requests = [];
 
   const server = createServer((req, res) => {
@@ -289,7 +323,7 @@ export async function startWebDavServer(options = {}) {
     if (req.method === "PROPFIND") {
       const depthHeader = String(req.headers.depth ?? "1").toLowerCase();
       const depth = depthHeader === "0" ? 0 : depthHeader === "infinity" ? Number.POSITIVE_INFINITY : 1;
-      const xml = propfindResponseXml(relativePath, node, depth);
+      const xml = propfindResponseXml(relativePath, node, depth, extraHrefs);
       res.writeHead(207, {
         "Content-Type": "text/xml; charset=utf-8",
         "Content-Length": Buffer.byteLength(xml)

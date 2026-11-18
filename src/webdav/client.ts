@@ -7,7 +7,6 @@
 import { hostRequest } from "../http/host.ts";
 import type { HostRequest, HttpResponseData } from "../http/host.ts";
 import { redactUrl } from "../errors.ts";
-import { normalizeDavPath } from "../util/names.ts";
 import { parseMultistatus } from "./xml.ts";
 import type { DavEntry } from "./xml.ts";
 
@@ -63,8 +62,10 @@ export function encodePath(path: string): string {
     .join("/");
 }
 
+const CONTROL_CHAR_PATTERN = /[\u0000-\u001F\u007F]/;
+
 /**
- * 拒绝路径里的 .. 段与反斜杠（单重与双重百分号编码都要拦），绝对 URL 与相对路径都要过。
+ * 拒绝路径里的 .. 段、反斜杠与控制字符（单重与双重百分号编码都要拦），绝对 URL 与相对路径都要过。
  *
  * 为什么解码两次：内部路径里若出现字面 "%5C" / "%2e%2e"，编码上线后会变成
  * %255C / %252e%252e；只解一次看不出危险，但会二次解码的服务器仍可能越界。
@@ -77,6 +78,10 @@ function assertNoTraversalPath(path: string, context: string): void {
       // 反斜杠：某些服务器把它当目录分隔符，/..\..\secret 会越出 rootPath。
       if (segment.includes("\\")) {
         throw new Error(context + "里不能包含反斜杠（服务器可能把它当成目录分隔符）");
+      }
+      // NUL / 控制字符：名字已损坏，不允许进请求。
+      if (CONTROL_CHAR_PATTERN.test(segment)) {
+        throw new Error(context + "里不能包含控制字符（名字已损坏）");
       }
       // %2F 解码后可能再生出新的分段，逐个再查一遍。
       for (const sub of segment.split("/")) {
@@ -234,36 +239,77 @@ function rawUrlPath(value: string): string {
   return path;
 }
 
-/**
- * href 的路径部分解码一次后是否含反斜杠。
- *
- * 这类条目不能进内部路径（请求层会拒绝），但列目录时也不能让一条脏数据
- * 弄挂整次扫描：调用方跳过它并计数，不要抛异常。
- */
-export function hrefHasBackslash(href: string): boolean {
-  return decodePercentSafe(rawUrlPath(href)).includes("\\");
-}
-
-/** 把 href 换算成「相对扫描根路径」的路径（已解码，以 / 开头）；不安全条目返回 null。 */
-export function hrefToRelativePath(href: string, rootUrl: string): string | null {
-  const hrefPath = toPathKey(rawUrlPath(href));
-  // 反斜杠条目由调用方跳过并计数（见 hrefHasBackslash），这里不抛异常。
-  if (hrefPath.includes("\\")) {
+function decodePercentStrict(text: string): string | null {
+  try {
+    return decodeURIComponent(text);
+  } catch {
     return null;
   }
+}
+
+/**
+ * 列目录时的「不安全条目」判定：纯函数，永不抛异常。
+ *
+ * 规则与请求层 assertNoTraversalPath 对齐：href 的路径解码两次后若含反斜杠、
+ * 含 .. 段、含 NUL/控制字符，或者百分号编码根本解不开（无法证明安全），
+ * 就判为 unsafe。列表层遇到 unsafe 条目只跳过并计数，请求层遇到同类内部路径仍然抛错。
+ */
+export function isUnsafeHref(href: string): boolean {
+  const path = rawUrlPath(href);
+  if (path.includes("\\")) {
+    return true;
+  }
+  const decodedOnce = decodePercentStrict(path);
+  if (decodedOnce === null) {
+    return true;
+  }
+  const decodedTwice = decodePercentStrict(decodedOnce);
+  if (decodedTwice === null) {
+    return true;
+  }
+  for (const candidate of [decodedOnce, decodedTwice]) {
+    if (candidate.includes("\\") || CONTROL_CHAR_PATTERN.test(candidate)) {
+      return true;
+    }
+    for (const segment of candidate.split("/")) {
+      if (segment === "..") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** 折叠重复斜杠、去掉结尾斜杠（只整理字符串，不做安全检查）。 */
+function tidyRelativePath(value: string): string {
+  let out = value.startsWith("/") ? value : "/" + value;
+  out = out.replace(/\/{2,}/g, "/");
+  if (out.length > 1) {
+    out = out.replace(/\/+$/, "");
+  }
+  return out === "" ? "/" : out;
+}
+
+/**
+ * 把 href 换算成「相对扫描根路径」的路径（解码一次，以 / 开头）；不在根路径下返回 null。
+ *
+ * 这里只做字符串换算，不抛异常：不安全名字（反斜杠 / .. / 控制字符）由
+ * isUnsafeHref 判定，调用方负责跳过并计数，避免一条脏数据打断整次扫描。
+ */
+export function hrefToRelativePath(href: string, rootUrl: string): string | null {
+  const hrefPath = toPathKey(rawUrlPath(href));
   const rootPath = toPathKey(rawUrlPath(rootUrl));
   if (hrefPath === rootPath) {
     return "/";
   }
   if (rootPath === "/") {
-    return normalizeDavPath(hrefPath);
+    return tidyRelativePath(hrefPath);
   }
   if (!hrefPath.startsWith(rootPath + "/")) {
     return null;
   }
-  return normalizeDavPath(hrefPath.slice(rootPath.length));
+  return tidyRelativePath(hrefPath.slice(rootPath.length));
 }
-
 function describeHttpError(method: string, url: string, response: HttpResponseData): Error {
   const status = response.status;
   const safeUrl = redactUrl(url);

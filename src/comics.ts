@@ -29,10 +29,14 @@ import { PLUGIN_ID } from "./plugin-info.ts";
 import { withFriendlyErrors } from "./errors.ts";
 import { loadSettings } from "./settings.ts";
 import type { WebDavSettings } from "./settings.ts";
-import { createWebDavClient, hrefHasBackslash } from "./webdav/client.ts";
+import { createWebDavClient, isUnsafeHref } from "./webdav/client.ts";
 import type { WebDavClient } from "./webdav/client.ts";
 import { downloadFileBytes } from "./http/download.ts";
-import { scanComicsDetailed, sortImagePaths } from "./webdav/scan.ts";
+import {
+  dirtyEntriesWarning,
+  scanComicsDetailed,
+  sortImagePaths
+} from "./webdav/scan.ts";
 import type { ComicEntry, ScanResult } from "./webdav/scan.ts";
 import { decodeComicId, encodeComicId, encodePageUrl, parsePageUrl } from "./webdav/ids.ts";
 import type { ComicKind } from "./webdav/ids.ts";
@@ -336,23 +340,49 @@ function buildChapterSummary(comic: ComicRef): ChapterSummary {
   };
 }
 
-async function listDirImages(client: WebDavClient, comicPath: string): Promise<string[]> {
+/** path 是否在 dir 之下（子项，不含 dir 自身）。 */
+function isUnderDirectory(path: string, dir: string): boolean {
+  return dir === "/" ? path.startsWith("/") : path.startsWith(dir + "/");
+}
+
+type DirImagesResult = {
+  images: string[];
+  /** 名字不安全（反斜杠 / 可疑 .. / 控制字符）而被跳过的图片数。 */
+  skipped: number;
+};
+
+async function listDirImagesDetailed(
+  client: WebDavClient,
+  comicPath: string
+): Promise<DirImagesResult> {
   const entries = await client.list(comicPath, 1);
   const images: string[] = [];
+  let skipped = 0;
   for (const entry of entries) {
     if (entry.isCollection) {
       continue;
     }
-    // 含反斜杠的条目在请求层会被拒绝，这里直接跳过，不要让一条脏数据弄挂整本漫画。
-    if (hrefHasBackslash(entry.href)) {
+    // 先做不抛异常的根路径换算：根外条目静默忽略，不算跳过。
+    const relative = client.relativePath(entry.href);
+    if (relative === null || relative === "" || !isUnderDirectory(relative, comicPath)) {
       continue;
     }
-    const relative = client.relativePath(entry.href);
-    if (relative !== null && isImageFile(relative)) {
+    // 不安全条目（请求层会拒绝）直接跳过，不要让一条脏数据弄挂整本漫画。
+    if (isUnsafeHref(entry.href)) {
+      if (isImageFile(relative)) {
+        skipped += 1;
+      }
+      continue;
+    }
+    if (isImageFile(relative)) {
       images.push(relative);
     }
   }
-  return sortImagePaths(images);
+  return { images: sortImagePaths(images), skipped };
+}
+
+async function listDirImages(client: WebDavClient, comicPath: string): Promise<string[]> {
+  return (await listDirImagesDetailed(client, comicPath)).images;
 }
 
 function dirPage(comicPath: string, imagePath: string, index: number): ChapterPage {
@@ -418,20 +448,29 @@ async function loadZipBytes(client: WebDavClient, path: string): Promise<Uint8Ar
   return task;
 }
 
-/** 构造章节 + 页面。目录漫画列目录，CBZ 读中央目录。 */
-export async function buildChapterWithPages(
+type ChapterWithPagesResult = {
+  chapter: ChapterWithPages;
+  /** 列目录时被跳过的脏图片数（用于冷启动也能给出 warning）。 */
+  skipped: number;
+};
+
+/** 构造章节 + 页面，并返回列目录时跳过的脏图片数。 */
+export async function buildChapterWithPagesDetailed(
   client: WebDavClient,
   comic: ComicRef
-): Promise<ChapterWithPages> {
+): Promise<ChapterWithPagesResult> {
   const summary = buildChapterSummary(comic);
   if (comic.kind === "dir") {
-    const images = await listDirImages(client, comic.path);
-    if (images.length === 0) {
+    const listed = await listDirImagesDetailed(client, comic.path);
+    if (listed.images.length === 0) {
       throw new Error("这个目录里没有图片");
     }
     return {
-      ...summary,
-      pages: images.map((imagePath, index) => dirPage(comic.path, imagePath, index))
+      chapter: {
+        ...summary,
+        pages: listed.images.map((imagePath, index) => dirPage(comic.path, imagePath, index))
+      },
+      skipped: listed.skipped
     };
   }
 
@@ -441,9 +480,20 @@ export async function buildChapterWithPages(
     throw new Error("CBZ 里没有图片");
   }
   return {
-    ...summary,
-    pages: images.map((entry, index) => zipPage(comic.path, entry, index))
+    chapter: {
+      ...summary,
+      pages: images.map((entry, index) => zipPage(comic.path, entry, index))
+    },
+    skipped: 0
   };
+}
+
+/** 构造章节 + 页面（兼容旧调用，只要章节）。 */
+export async function buildChapterWithPages(
+  client: WebDavClient,
+  comic: ComicRef
+): Promise<ChapterWithPages> {
+  return (await buildChapterWithPagesDetailed(client, comic)).chapter;
 }
 
 /** 由 comicId / extern 解析漫画引用。 */
@@ -613,8 +663,11 @@ export async function getComicDetail(
     const title = comicTitle(comic.kind, comic.path);
 
     let cover: ImageItem;
+    let skippedImages = 0;
     if (comic.kind === "dir") {
-      const images = await listDirImages(client, comic.path);
+      const listed = await listDirImagesDetailed(client, comic.path);
+      skippedImages = listed.skipped;
+      const images = listed.images;
       if (images.length === 0) {
         throw new Error("这个目录里没有图片");
       }
@@ -628,6 +681,11 @@ export async function getComicDetail(
     } else {
       cover = makeCover({ kind: comic.kind, path: comic.path, name: title });
     }
+
+    // 冷启动直接进详情时没跑过扫描，lastScanWarning 是空的；
+    // 用本次列目录的跳过计数补一条，保证 warning 看得到。
+    const warning =
+      lastScanWarning ?? (skippedImages > 0 ? dirtyEntriesWarning(skippedImages) : null);
 
     const chapter = buildChapterSummary(comic);
     const normal: ComicDetailNormal = {
@@ -651,7 +709,7 @@ export async function getComicDetail(
         },
         description: appendWarning(
           comic.kind === "cbz" ? "WebDAV 上的 CBZ 整包。" : "WebDAV 上的图片文件夹。",
-          lastScanWarning
+          warning
         ),
         cover,
         metadata: [
@@ -661,7 +719,7 @@ export async function getComicDetail(
             value: [{ name: comic.path, onTap: null, onLongPress: comic.path, extern: {} }]
           }
         ],
-        extern: { kind: comic.kind, path: comic.path, ...warningFields(lastScanWarning) }
+        extern: { kind: comic.kind, path: comic.path, ...warningFields(warning) }
       },
       eps: [chapter],
       recommend: [],
@@ -674,13 +732,13 @@ export async function getComicDetail(
       allowLike: false,
       allowCollected: false,
       allowDownload: true,
-      extern: { ...warningFields(lastScanWarning) }
+      extern: { ...warningFields(warning) }
     };
 
     return {
       source: PLUGIN_ID,
       comicId: asText(payload.comicId) || encodeComicId(comic.kind, comic.path),
-      extern: externWithWarning(payload.extern, lastScanWarning),
+      extern: externWithWarning(payload.extern, warning),
       scheme: { version: "1.0.0", type: "comicDetail", source: PLUGIN_ID },
       data: {
         normal,
@@ -700,17 +758,18 @@ export async function getReadSnapshot(
       asText(payload.comicId) || payload.chapterId,
       payload.extern
     );
-    const chapter = await buildChapterWithPages(client, comic);
+    const { chapter, skipped } = await buildChapterWithPagesDetailed(client, comic);
+    const warning = lastScanWarning ?? (skipped > 0 ? dirtyEntriesWarning(skipped) : null);
     const title = comicTitle(comic.kind, comic.path);
     return {
       source: PLUGIN_ID,
-      extern: externWithWarning(payload.extern, lastScanWarning),
+      extern: externWithWarning(payload.extern, warning),
       data: {
         comic: {
           id: encodeComicId(comic.kind, comic.path),
           source: PLUGIN_ID,
           title,
-          extern: { kind: comic.kind, path: comic.path, ...warningFields(lastScanWarning) }
+          extern: { kind: comic.kind, path: comic.path, ...warningFields(warning) }
         },
         chapter,
         chapters: [
@@ -729,20 +788,21 @@ export async function getChapter(payload: ChapterPayload = {}): Promise<ChapterC
       asText(payload.comicId) || payload.chapterId,
       payload.extern
     );
-    const chapter = await buildChapterWithPages(client, comic);
+    const { chapter, skipped } = await buildChapterWithPagesDetailed(client, comic);
+    const warning = lastScanWarning ?? (skipped > 0 ? dirtyEntriesWarning(skipped) : null);
     const title = comicTitle(comic.kind, comic.path);
     return {
       source: PLUGIN_ID,
       comicId: asText(payload.comicId) || chapter.id,
       chapterId: chapter.id,
-      extern: externWithWarning(payload.extern, lastScanWarning),
+      extern: externWithWarning(payload.extern, warning),
       scheme: { version: "1.0.0", type: "chapterContent", source: PLUGIN_ID },
       data: {
         comic: {
           id: encodeComicId(comic.kind, comic.path),
           source: PLUGIN_ID,
           title,
-          extern: { kind: comic.kind, path: comic.path, ...warningFields(lastScanWarning) }
+          extern: { kind: comic.kind, path: comic.path, ...warningFields(warning) }
         },
         chapter,
         chapters: [chapter]

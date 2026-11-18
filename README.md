@@ -9,7 +9,7 @@
 - 详情页、阅读快照、按页取原图；
 - 错误提示都是中文人话。
 
-当前版本 0.1.0。PDF 不做。
+当前版本 0.1.1。PDF 不做。
 
 ## 在 Breeze 里安装
 
@@ -79,6 +79,7 @@
 - **扫描缓存**：同一套设置 45 秒内复用上次结果；刚往网盘加了漫画，最多等 45 秒再刷新。
 - **密码明文保存**：密码是普通设置字段，宿主只做遮挡显示，落盘未见加密（与 Breeze 其他插件的设置一致）。
 - **PROPFIND 依赖未文档化全局**：__http_request_promise 不是官方文档 API，Breeze 未来若收紧会失效。
+- **运行时是 text-encoding polyfill**：Breeze 的 QuickJS 运行时替换了全局 TextDecoder，不支持 `fatal` 选项，传了会在构造时直接抛异常（Node 支持，所以本机测试发现不了）。插件只使用不带选项的 UTF-8 解码，非法 UTF-8 由 U+FFFD 检查拒绝；后续维护不要给 TextDecoder/TextEncoder 传 Node 专有选项。
 - **图片字节不进宿主 cache**：宿主 cache 单值上限 500 KiB，图片只走模块内 LRU 或直取。
 
 ## 构建与测试

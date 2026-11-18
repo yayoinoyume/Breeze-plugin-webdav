@@ -3,7 +3,7 @@
   "uuid": "a7d0c1f4-5b2e-4c93-9d61-3f2b8e7a4c10",
   "iconUrl": "",
   "describe": "通过 WebDAV 读取 NAS / 网盘上的漫画：目录浏览、按页取图、整包下载 CBZ。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "npmName": "breeze-plugin-webdav",
   "function": [
     {

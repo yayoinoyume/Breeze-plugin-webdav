@@ -33,7 +33,6 @@ import { createWebDavClient } from "./webdav/client.ts";
 import type { WebDavClient } from "./webdav/client.ts";
 import { downloadFileBytes } from "./http/download.ts";
 import {
-  isFatalListError,
   scanComicsDetailed,
   skippedEntriesWarning,
   sortImagePaths
@@ -163,6 +162,17 @@ function asText(value: unknown): string {
   return "";
 }
 
+/** 路径字段不能 trim：尾随空格是合法名字的一部分。 */
+function asPathText(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "";
+}
+
 function toIndex(values: unknown[], fallback: number): number {
   for (const value of values) {
     const number =
@@ -216,7 +226,8 @@ export async function listComicEntriesDetailed(
   const result = await scanComicsDetailed(
     {
       list: (input, depth) => client.list(input, depth),
-      relativePath: (href) => client.relativePath(href)
+      relativePath: (href) => client.relativePath(href),
+      canRequest: (input) => canClientRequest(client, input)
     },
     {
       rootPath: settings.rootPath,
@@ -380,11 +391,8 @@ async function listDirImagesDetailed(
   let entries: DavEntry[];
   try {
     entries = await client.list(comicPath, 1);
-  } catch (error) {
-    // 认证/协议级错误照旧整体抛；其余局部失败只影响这一本。
-    if (isFatalListError(error)) {
-      throw error;
-    }
+  } catch {
+    // 这一本列不出来：只影响这一本，由上层给出「列目录失败」的明确文案。
     return { images: [], skipped: 1, listFailed: true };
   }
   const images: string[] = [];
@@ -413,10 +421,6 @@ async function listDirImagesDetailed(
     }
   }
   return { images: sortImagePaths(images), skipped, listFailed: false };
-}
-
-async function listDirImages(client: WebDavClient, comicPath: string): Promise<string[]> {
-  return (await listDirImagesDetailed(client, comicPath)).images;
 }
 
 function dirPage(comicPath: string, imagePath: string, index: number): ChapterPage {
@@ -546,7 +550,7 @@ export function resolveComicRef(comicId: unknown, extern: unknown): ComicRef {
   const map = asRecord(extern);
   const kind =
     map.kind === "cbz" ? "cbz" : map.kind === "dir" ? "dir" : null;
-  const path = asText(map.path);
+  const path = asPathText(map.path);
   if (kind !== null && path !== "") {
     return { kind, path: tidyDavPath(path) };
   }
@@ -566,7 +570,7 @@ export async function fetchPageBytes(
 ): Promise<Uint8Array> {
   const map = asRecord(extern);
   const parsed = parsePageUrl(url ?? "");
-  const rawComicPath = asText(map.path) || (parsed === null ? "" : parsed.path);
+  const rawComicPath = asPathText(map.path) || (parsed === null ? "" : parsed.path);
   if (rawComicPath === "") {
     throw new Error("图片地址无效");
   }
@@ -583,13 +587,17 @@ export async function fetchPageBytes(
   const index = toIndex([map.index, parsed === null ? undefined : parsed.index], 0);
 
   if (kind === "dir") {
-    let imagePath = asText(map.imagePath);
+    let imagePath = asPathText(map.imagePath);
     if (imagePath !== "" && !isAbsoluteUrl(imagePath)) {
       imagePath = tidyDavPath(imagePath);
     }
     if (imagePath === "") {
-      const images = await listDirImages(client, comicPath);
-      imagePath = images[index] ?? "";
+      const listed = await listDirImagesDetailed(client, comicPath);
+      if (listed.listFailed) {
+        // 区分「列目录失败」和「条目不存在」，别让用户以为图被删了。
+        throw new Error("读取这个目录失败（列目录失败）");
+      }
+      imagePath = listed.images[index] ?? "";
     }
     if (imagePath === "") {
       throw new Error("找不到这张图片");

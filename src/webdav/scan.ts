@@ -11,7 +11,6 @@
  */
 
 import type { DavEntry } from "./xml.ts";
-import { USER_MESSAGES, friendlyMessage } from "../errors.ts";
 import {
   baseName,
   comicTitle,
@@ -82,19 +81,6 @@ function budgetWarning(limit: number): string {
   return "目录太多，扫描已在上限 " + limit + " 次列目录请求处停止，结果可能不完整";
 }
 
-/**
- * 哪些列目录失败属于「整体不可用」，必须向上抛：
- * 认证失败、服务器不支持 PROPFIND、宿主太旧。其余（单个目录超时/404 等）只跳过该目录。
- */
-export function isFatalListError(error: unknown): boolean {
-  const message = friendlyMessage(error);
-  return (
-    message === USER_MESSAGES.auth ||
-    message === USER_MESSAGES.propfind ||
-    message === USER_MESSAGES.oldHost
-  );
-}
-
 /** 列表阶段确实跳过条目/列目录失败时的中文提示（带数量）。 */
 export function skippedEntriesWarning(count: number): string {
   return (
@@ -135,10 +121,11 @@ export async function scanComicsDetailed(
     try {
       entries = await lister.list(current.path, 1);
     } catch (error) {
-      // 认证/协议级错误整体抛；单个目录的局部失败只跳过它，整次扫描继续。
-      if (isFatalListError(error)) {
+      // 根目录列不出来 = 整库不可用（认证、404、405、超时都要让人看到），必须抛。
+      if (current.depth === 0) {
         throw error;
       }
+      // 更深层的目录失败只跳过它并计数，不拖垮整库。
       skippedEntries += 1;
       continue;
     }
@@ -153,7 +140,12 @@ export async function scanComicsDetailed(
         // 不在设置的 rootPath 下（例如服务器多返回了别处的条目）：静默忽略。
         continue;
       }
-      // 列表层不做安全判定：名字再怪也进结果集，只有真正要发请求时才可能失败。
+      // 发不出请求的条目（文件或目录）不进结果集：跳过并计数。
+      // 文件也必须过滤，否则一条脏图片 href 会把父目录伪装成漫画。
+      if (lister.canRequest !== undefined && !lister.canRequest(relative)) {
+        skippedEntries += 1;
+        continue;
+      }
       children.push({ entry, path: relative });
     }
     children.sort((left, right) => naturalCompare(left.path, right.path));
@@ -194,16 +186,9 @@ export async function scanComicsDetailed(
 
     if (images.length === 0 && current.depth < scanDepth) {
       for (const child of children) {
-        if (!child.entry.isCollection) {
-          continue;
+        if (child.entry.isCollection) {
+          queue.push({ path: child.path, depth: current.depth + 1 });
         }
-        // 下钻前才判定：这条路径发不出去（含字面 .. / 反斜杠 / 控制字符）就跳过并计数，
-        // 不要等 list 抛了再挂掉整次扫描。
-        if (lister.canRequest !== undefined && !lister.canRequest(child.path)) {
-          skippedEntries += 1;
-          continue;
-        }
-        queue.push({ path: child.path, depth: current.depth + 1 });
       }
     }
   }

@@ -73,7 +73,8 @@ export function isCbzFile(name: string): boolean {
 
 /** 只做字符串整理：补前导斜杠、折叠重复斜杠、去掉结尾斜杠。不做安全检查，永不抛。 */
 export function tidyDavPath(path: string): string {
-  let value = String(path ?? "").trim();
+  // 路径层不 trim：文件名尾随空格是合法字符，不能悄悄改掉。
+  let value = String(path ?? "");
   if (value === "") {
     return "/";
   }
@@ -89,7 +90,8 @@ export function tidyDavPath(path: string): string {
 
 /** 整理路径并拒绝真实危险形态（字面反斜杠、.. 段）。只用于请求层与设置项。 */
 export function normalizeDavPath(path: string): string {
-  const value = tidyDavPath(path);
+  // 设置项（用户输入）允许首尾空白；整理后再做安全检查。
+  const value = tidyDavPath(String(path ?? "").trim());
   // 反斜杠：有些 WebDAV 服务器把它当目录分隔符，放过去就能绕过下面的 .. 检查。
   if (value.includes("\\")) {
     throw new Error("路径里不能包含反斜杠（服务器可能把它当成目录分隔符）");

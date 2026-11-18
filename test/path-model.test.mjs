@@ -104,7 +104,7 @@ test("literal-percent-name-ok 合法 % 名字（100%.png、50% off/整包2.cbz�
   }
 });
 
-test("real-traversal-href-skipped 真实危险 href（解码后含字面 ..）不中断列表，只让该条失败", async () => {
+test("real-traversal-href-skipped 真实危险 href（解码后含字面 ..）不进结果集，直接打开也明确报错", async () => {
   const { server, comics } = await bootServer({
     rootPath: "/comics",
     extraHrefs: [
@@ -115,25 +115,30 @@ test("real-traversal-href-skipped 真实危险 href（解码后含字面 ..）�
   });
   try {
     const list = await comics.getComicList({ page: 1 });
-    assert.ok(list.data.items.length >= 3, "其它漫画照常列出");
-    const dangerous = list.data.items.find((item) => item.extern?.path === "/comics/../危险.cbz");
-    assert.ok(dangerous, "危险 CBZ 会被列出（列表层不判定），但打开时必须失败");
+    assert.deepEqual(
+      list.data.items.map((item) => item.extern?.path).sort(),
+      ["/comics/100%20", "/comics/整包.cbz", "/comics/目录漫画"],
+      "危险条目（文件/目录）都不能进结果集"
+    );
     assert.match(
       String(list.extern?.scanWarning ?? ""),
       /有 \d+ 个条目无法安全读取/,
-      "字面 .. 目录被跳过时要如实计数"
+      "被过滤的危险条目要如实计数"
     );
     assert.ok(
       server.requests.every((request) => !request.path.includes("..")),
       "不能对解码后含 .. 的路径发请求：" + server.requests.map((r) => r.path).join(" | ")
     );
 
+    // 拿着旧 id 直接打开也要明确报错。
+    const { encodeComicId } = await import("../src/webdav/ids.ts");
+    const dangerousId = encodeComicId("cbz", "/comics/../危险.cbz");
     await assert.rejects(
-      () => comics.getComicDetail({ comicId: dangerous.id, extern: {} }),
+      () => comics.getComicDetail({ comicId: dangerousId, extern: {} }),
       /这一项的路径不安全，已跳过/
     );
     await assert.rejects(
-      () => comics.getReadSnapshot({ comicId: dangerous.id, extern: {} }),
+      () => comics.getReadSnapshot({ comicId: dangerousId, extern: {} }),
       /这一项的路径不安全，已跳过/
     );
 
@@ -153,8 +158,12 @@ test("control-char-href-skipped 解码后含 NUL 控制字符的路径：列表�
   });
   try {
     const list = await comics.getComicList({ page: 1 });
-    const bad = list.data.items.find((item) => item.extern?.path === "/comics/\u0000bad.cbz");
-    assert.ok(bad, "控制字符条目会被列出（列表层不判定）");
+    assert.equal(list.data.items.length, 3, "控制字符条目不能进结果集，其它三本照常");
+    assert.match(
+      String(list.extern?.scanWarning ?? ""),
+      /有 \d+ 个条目无法安全读取/,
+      "被过滤的控制字符条目要计数"
+    );
     // id 层本来就拒绝控制字符；这里直接用 extern 取图，验证请求层给出明确错误。
     await assert.rejects(
       () =>

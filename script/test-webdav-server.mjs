@@ -130,6 +130,17 @@ export function createFixture(options = {}) {
     comicsDir.children.set("漫画 😀", dir({ "第 1 页.png": file(makePngLike(11 * 1024, 66)) }));
   }
 
+  if (Array.isArray(options.emptyDirs)) {
+    const comicsDir = root.children.get("comics");
+    for (const name of options.emptyDirs) {
+      comicsDir.children.set(String(name), dir({}));
+    }
+  }
+  if (options.trailingSpaceName === true) {
+    // 名字里的空格是合法字符：a<空格>.png。
+    root.children.get("comics").children.set("a .png", file(makePngLike(7 * 1024, 67)));
+  }
+
   const files = new Map();
   const walk = (node, relative) => {
     if (node.type === "file") {
@@ -280,9 +291,12 @@ export async function startWebDavServer(options = {}) {
   const fixture = createFixture({
     backslashEntry: options.backslashEntry === true,
     dirtyEntries: Array.isArray(options.dirtyEntries) ? options.dirtyEntries : [],
-    percentNames: options.percentNames === true
+    percentNames: options.percentNames === true,
+    emptyDirs: Array.isArray(options.emptyDirs) ? options.emptyDirs : [],
+    trailingSpaceName: options.trailingSpaceName === true
   });
   const extraHrefs = Array.isArray(options.extraHrefs) ? options.extraHrefs : [];
+  const forbiddenPaths = Array.isArray(options.forbiddenPaths) ? options.forbiddenPaths : [];
   const requests = [];
 
   const server = createServer((req, res) => {
@@ -308,6 +322,16 @@ export async function startWebDavServer(options = {}) {
         "WWW-Authenticate": 'Basic realm="webdav-test"'
       });
       res.end("unauthorized");
+      return;
+    }
+
+    if (
+      forbiddenPaths.some(
+        (prefix) => path === prefix || path.startsWith(prefix + "/")
+      )
+    ) {
+      res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("forbidden");
       return;
     }
 

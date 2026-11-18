@@ -10,7 +10,7 @@ import type { HostRequest, HttpResponseData } from "./host.ts";
 import { redactUrl } from "../errors.ts";
 
 export const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
-export const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
+export const MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024;
 
 export type DownloadOptions = {
   /** 已知文件长度时直接分块；不传则先 HEAD / Range 探测。 */
@@ -190,7 +190,9 @@ export async function probeContentLength(
       return null;
     }
     if (probe.status === 200) {
-      return parseContentLength(probe.headers);
+      // 服务器忽略 Range，这一次探测已经拿到整包；不再接受这个长度，
+      // 避免后续再发一次整包 GET（也避免把大文件当小文件处理）。
+      return null;
     }
     if (probe.status === 416) {
       const matched = /^bytes\s+\*\/(\d+)$/i.exec(

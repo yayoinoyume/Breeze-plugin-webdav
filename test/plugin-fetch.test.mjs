@@ -55,7 +55,6 @@ function makeClient(requests) {
     baseUrl: "http://nas.local/dav",
     username: "demo",
     password: "demo",
-    rootPath: "/",
     request: fakeServer(requests)
   });
 }

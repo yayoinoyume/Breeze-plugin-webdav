@@ -65,7 +65,6 @@ test("plugin-pages CBZ 读中央目录并按自然序排页", async () => {
     baseUrl: "http://nas.local/dav",
     username: "demo",
     password: "demo",
-    rootPath: "/",
     request: async (spec) => {
       if (spec.method === "HEAD") {
         return {
@@ -105,7 +104,6 @@ test("plugin-pages 空目录和空 CBZ 给出人话错误", async () => {
   const emptyZip = zipSync({ "readme.txt": makeBytes(8, 0) }, { level: 0 });
   const client = createWebDavClient({
     baseUrl: "http://nas.local/dav",
-    rootPath: "/",
     request: async (spec) =>
       spec.method === "HEAD"
         ? {

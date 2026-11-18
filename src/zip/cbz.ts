@@ -5,7 +5,7 @@
  * 这里先用中央目录拿到页名与偏移，读某一页时只 inflate 这一个条目。
  */
 
-import { inflateSync } from "fflate";
+import { Inflate } from "fflate";
 import { isImageFile, naturalCompare } from "../util/names.ts";
 
 export type ZipEntry = {
@@ -19,6 +19,7 @@ export type ZipEntry = {
 
 export const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
 export const MAX_COMPRESSION_RATIO = 1000;
+const INFLATE_INPUT_CHUNK = 8 * 1024;
 
 const EOCD_SIGNATURE = 0x06054b50;
 const CENTRAL_SIGNATURE = 0x02014b50;
@@ -158,16 +159,65 @@ export function extractZipEntry(zipBytes: Uint8Array, entry: ZipEntry): Uint8Arr
     return compressed.slice(0, entry.uncompressedSize);
   }
   if (entry.method === 8) {
-    const inflated = inflateSync(compressed);
-    if (inflated.length > MAX_ENTRY_BYTES) {
-      throw new Error(
-        "CBZ 里的这一页解压后太大（超过 " + MAX_ENTRY_BYTES / (1024 * 1024) + " MiB），暂不支持"
-      );
-    }
-    if (entry.uncompressedSize > 0 && inflated.length !== entry.uncompressedSize) {
-      throw new Error("CBZ 解压长度与中央目录不一致");
-    }
-    return inflated.subarray(0, inflated.length);
+    return inflateEntryWithLimit(compressed, entry.uncompressedSize);
   }
   throw new Error("CBZ 使用了不支持的压缩方式：" + String(entry.method));
+}
+
+/**
+ * 流式 inflate：边解边计数，超过上限或与中央目录声明不一致立刻停止。
+ * 不信任中央目录的 uncompressedSize，也不用它预分配。
+ */
+function inflateEntryWithLimit(compressed: Uint8Array, declaredSize: number): Uint8Array {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let failure: Error | null = null;
+
+  const stream = new Inflate((chunk) => {
+    if (failure !== null || chunk.length === 0) {
+      return;
+    }
+    total += chunk.length;
+    if (total > MAX_ENTRY_BYTES) {
+      failure = new Error(
+        "CBZ 里的这一页解压后太大（超过 " + MAX_ENTRY_BYTES / (1024 * 1024) + " MiB），暂不支持"
+      );
+      return;
+    }
+    if (declaredSize > 0 && total > declaredSize) {
+      failure = new Error("CBZ 解压长度与中央目录不一致");
+      return;
+    }
+    chunks.push(chunk);
+  });
+
+  try {
+    for (let offset = 0; offset < compressed.length; offset += INFLATE_INPUT_CHUNK) {
+      const end = Math.min(offset + INFLATE_INPUT_CHUNK, compressed.length);
+      stream.push(compressed.subarray(offset, end), end === compressed.length);
+      if (failure !== null) {
+        break;
+      }
+    }
+  } catch {
+    throw new Error("CBZ 解压失败（文件可能损坏）");
+  }
+
+  if (failure !== null) {
+    throw failure;
+  }
+  if (declaredSize > 0 && total !== declaredSize) {
+    throw new Error("CBZ 解压长度与中央目录不一致");
+  }
+  if (compressed.length > 0 && total / compressed.length > MAX_COMPRESSION_RATIO) {
+    throw new Error("CBZ 压缩比异常（可能损坏或恶意包），已拒绝解压");
+  }
+
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return output;
 }

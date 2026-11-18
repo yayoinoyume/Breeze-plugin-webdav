@@ -112,3 +112,27 @@ test("download-limit 超过插件上限直接拒绝", async () => {
   );
   assert.equal(requests, 0);
 });
+
+
+test("probe-ignore-range 服务器忽略 Range 返回 200 时探测失败，不再发第二次整包", async () => {
+  let getCount = 0;
+  const request = async (spec) => {
+    if (spec.method === "HEAD") {
+      return { status: 405, statusText: "", url: spec.url, headers: {}, bytes: new Uint8Array(0) };
+    }
+    getCount += 1;
+    return {
+      status: 200,
+      statusText: "OK",
+      url: spec.url,
+      headers: { "content-length": "20" },
+      bytes: new Uint8Array(20)
+    };
+  };
+
+  await assert.rejects(
+    () => downloadFileBytes("http://nas.local/dav/no-range.bin", { request }),
+    /拿不到文件长度/
+  );
+  assert.equal(getCount, 1, "探测失败后不应再发整包 GET");
+});

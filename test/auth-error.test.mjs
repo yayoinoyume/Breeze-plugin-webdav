@@ -46,7 +46,7 @@ test("auth-error PROPFIND 405 → 提示换 WebDAV 地址", async () => {
 
 test("auth-error 没有宿主网络桥 → 提示 Breeze 版本太旧", async () => {
   delete globalThis.__http_request_promise;
-  const client = createWebDavClient({ baseUrl: "http://nas.local/dav", rootPath: "/" });
+  const client = createWebDavClient({ baseUrl: "http://nas.local/dav" });
   await assert.rejects(() => client.list("/"), /当前 Breeze 版本太旧，插件用不了/);
 });
 

@@ -46,3 +46,23 @@ test("cross-origin baseUrl 里的 userinfo 会被剥离，不会进入请求 URL
   assert.equal(normalized.includes(userInfoPassword), false);
   assert.equal(normalized.includes("@"), false);
 });
+
+
+test("default-port originOf 归一 http:80 与 https:443，不再误判跨站", () => {
+  assert.equal(originOf("http://nas.local:80/dav"), "http://nas.local");
+  assert.equal(originOf("https://nas.local:443/dav"), "https://nas.local");
+  assert.equal(originOf("http://nas.local:8080/dav"), "http://nas.local:8080");
+  assert.equal(originOf("HTTP://NAS.LOCAL:80/dav"), "http://nas.local");
+
+  const client = createWebDavClient({
+    baseUrl: "http://nas.local:80/dav",
+    request: async (spec) => ({
+      status: 200,
+      statusText: "OK",
+      url: spec.url,
+      headers: {},
+      bytes: new Uint8Array(0)
+    })
+  });
+  assert.equal(client.urlFor("http://nas.local/dav/x.png"), "http://nas.local/dav/x.png");
+});

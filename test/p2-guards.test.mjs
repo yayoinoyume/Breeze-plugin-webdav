@@ -42,3 +42,26 @@ test("natural-sort 对齐 Breeze：小写化、数字按 int、忽略前导零",
   assert.equal(naturalCompare("A.png", "a.png"), 0);
   assert.equal(naturalCompare("01.png", "1.png"), 0);
 });
+
+
+test("abs-url-traversal 绝对 URL 与相对路径都拒绝 ..，且不发请求", () => {
+  const requests = [];
+  const client = createWebDavClient({
+    baseUrl: "http://nas.local/dav",
+    request: async (spec) => {
+      requests.push(spec);
+      return { status: 200, statusText: "OK", url: spec.url, headers: {}, bytes: new Uint8Array(0) };
+    }
+  });
+
+  assert.throws(
+    () => client.urlFor("http://nas.local/dav/../secret"),
+    /不能包含 \.\./
+  );
+  assert.throws(() => client.urlFor("/dav/../secret"), /不能包含 \.\./);
+  assert.throws(
+    () => client.urlFor("http://nas.local/dav/%2e%2e/secret"),
+    /不能包含 \.\./
+  );
+  assert.equal(requests.length, 0);
+});

@@ -90,6 +90,7 @@ export {
   SEARCH_PAGE_SIZE,
   buildChapterWithPages,
   buildListItem,
+  ZIP_CACHE_BUDGET_BYTES,
   clearScanCache,
   clearZipCache,
   clientForSettings,
@@ -107,6 +108,9 @@ export {
   resolveComicRef,
   searchComic,
   searchComicsWith,
+  setZipCacheBudgetForTests,
+  zipCacheBytes,
+  zipCacheKeys,
   zipCachePaths
 } from "./comics.ts";
 export type { PageSlice } from "./comics.ts";

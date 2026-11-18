@@ -48,10 +48,14 @@ import {
 export const SEARCH_PAGE_SIZE = 20;
 export const MAIN_CHAPTER_NAME = "全一话";
 
-const ZIP_CACHE_LIMIT = 2;
+export const ZIP_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
 const SCAN_CACHE_TTL_MS = 45 * 1000;
 
+let zipCacheBudget = ZIP_CACHE_BUDGET_BYTES;
+
 type CachedZip = {
+  /** baseUrl + username + 路径，换账号不会串包。 */
+  key: string;
   path: string;
   bytes: Uint8Array;
 };
@@ -77,6 +81,37 @@ type ComicRef = {
 export function clearZipCache(): void {
   zipCache.length = 0;
   inflightZip.clear();
+  zipCacheBudget = ZIP_CACHE_BUDGET_BYTES;
+}
+
+/** 调整 CBZ 缓存预算（测试用）；传 null 恢复默认。 */
+export function setZipCacheBudgetForTests(bytes: number | null): void {
+  zipCacheBudget =
+    bytes === null ? ZIP_CACHE_BUDGET_BYTES : Math.max(1, Math.trunc(bytes));
+  trimZipCache();
+}
+
+function zipCacheKey(client: WebDavClient, path: string): string {
+  return client.baseUrl + "|" + String(client.options.username ?? "") + "|" + path;
+}
+
+function zipCacheBytesTotal(): number {
+  let total = 0;
+  for (const entry of zipCache) {
+    total += entry.bytes.length;
+  }
+  return total;
+}
+
+function trimZipCache(): void {
+  let total = zipCacheBytesTotal();
+  while (zipCache.length > 1 && total > zipCacheBudget) {
+    const removed = zipCache.pop();
+    if (removed === undefined) {
+      break;
+    }
+    total -= removed.bytes.length;
+  }
 }
 
 /** 清空扫描缓存（测试用）。 */
@@ -93,6 +128,16 @@ export function getLastScanWarning(): string | null {
 /** 当前缓存的 CBZ 路径（新的在前，测试用）。 */
 export function zipCachePaths(): string[] {
   return zipCache.map((entry) => entry.path);
+}
+
+/** 当前缓存的 CBZ 复合键（新的在前，测试用）。 */
+export function zipCacheKeys(): string[] {
+  return zipCache.map((entry) => entry.key);
+}
+
+/** 当前缓存占用的总字节数（测试用）。 */
+export function zipCacheBytes(): number {
+  return zipCacheBytesTotal();
 }
 
 function asRecord(value: unknown): StringMap {
@@ -337,14 +382,15 @@ function zipPage(comicPath: string, entry: ZipEntry, index: number): ChapterPage
 }
 
 async function loadZipBytes(client: WebDavClient, path: string): Promise<Uint8Array> {
-  const hit = zipCache.findIndex((entry) => entry.path === path);
+  const key = zipCacheKey(client, path);
+  const hit = zipCache.findIndex((entry) => entry.key === key);
   if (hit >= 0) {
     const cached = zipCache.splice(hit, 1)[0];
     zipCache.unshift(cached);
     return cached.bytes;
   }
 
-  const pending = inflightZip.get(path);
+  const pending = inflightZip.get(key);
   if (pending !== undefined) {
     return pending;
   }
@@ -354,19 +400,17 @@ async function loadZipBytes(client: WebDavClient, path: string): Promise<Uint8Ar
     request: client.options.request
   }).then(
     (result) => {
-      zipCache.unshift({ path, bytes: result.bytes });
-      if (zipCache.length > ZIP_CACHE_LIMIT) {
-        zipCache.pop();
-      }
-      inflightZip.delete(path);
+      zipCache.unshift({ key, path, bytes: result.bytes });
+      trimZipCache();
+      inflightZip.delete(key);
       return result.bytes;
     },
     (error) => {
-      inflightZip.delete(path);
+      inflightZip.delete(key);
       throw error;
     }
   );
-  inflightZip.set(path, task);
+  inflightZip.set(key, task);
   return task;
 }
 
@@ -480,6 +524,14 @@ function externWithWarning(value: unknown, warning: string | null): StringMap | 
   return { ...(extern ?? {}), scanWarning: warning };
 }
 
+function warningFields(warning: string | null): StringMap {
+  return warning === null ? {} : { scanWarning: warning };
+}
+
+function appendWarning(text: string, warning: string | null): string {
+  return warning === null ? text : text + "\n\n注意：" + warning;
+}
+
 async function scanWithSettings(): Promise<{
   client: WebDavClient;
   settings: WebDavSettings;
@@ -587,8 +639,10 @@ export async function getComicDetail(
           onTap: null,
           extern: {}
         },
-        description:
+        description: appendWarning(
           comic.kind === "cbz" ? "WebDAV 上的 CBZ 整包。" : "WebDAV 上的图片文件夹。",
+          lastScanWarning
+        ),
         cover,
         metadata: [
           {
@@ -597,7 +651,7 @@ export async function getComicDetail(
             value: [{ name: comic.path, onTap: null, onLongPress: comic.path, extern: {} }]
           }
         ],
-        extern: { kind: comic.kind, path: comic.path }
+        extern: { kind: comic.kind, path: comic.path, ...warningFields(lastScanWarning) }
       },
       eps: [chapter],
       recommend: [],
@@ -610,13 +664,13 @@ export async function getComicDetail(
       allowLike: false,
       allowCollected: false,
       allowDownload: true,
-      extern: {}
+      extern: { ...warningFields(lastScanWarning) }
     };
 
     return {
       source: PLUGIN_ID,
       comicId: asText(payload.comicId) || encodeComicId(comic.kind, comic.path),
-      extern: externOrNull(payload.extern),
+      extern: externWithWarning(payload.extern, lastScanWarning),
       scheme: { version: "1.0.0", type: "comicDetail", source: PLUGIN_ID },
       data: {
         normal,
@@ -640,13 +694,13 @@ export async function getReadSnapshot(
     const title = comicTitle(comic.kind, comic.path);
     return {
       source: PLUGIN_ID,
-      extern: externOrNull(payload.extern),
+      extern: externWithWarning(payload.extern, lastScanWarning),
       data: {
         comic: {
           id: encodeComicId(comic.kind, comic.path),
           source: PLUGIN_ID,
           title,
-          extern: { kind: comic.kind, path: comic.path }
+          extern: { kind: comic.kind, path: comic.path, ...warningFields(lastScanWarning) }
         },
         chapter,
         chapters: [
@@ -671,14 +725,14 @@ export async function getChapter(payload: ChapterPayload = {}): Promise<ChapterC
       source: PLUGIN_ID,
       comicId: asText(payload.comicId) || chapter.id,
       chapterId: chapter.id,
-      extern: externOrNull(payload.extern),
+      extern: externWithWarning(payload.extern, lastScanWarning),
       scheme: { version: "1.0.0", type: "chapterContent", source: PLUGIN_ID },
       data: {
         comic: {
           id: encodeComicId(comic.kind, comic.path),
           source: PLUGIN_ID,
           title,
-          extern: { kind: comic.kind, path: comic.path }
+          extern: { kind: comic.kind, path: comic.path, ...warningFields(lastScanWarning) }
         },
         chapter,
         chapters: [chapter]

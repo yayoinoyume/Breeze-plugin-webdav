@@ -48,3 +48,21 @@ test("zip-bomb 声明超大解压尺寸或异常压缩比时中文报错且不�
     /压缩比异常/
   );
 });
+
+
+test("zip-lying-size 中央目录谎报 16 字节但实际 80MiB 时快速报错", () => {
+  const payload = new Uint8Array(80 * 1024 * 1024);
+  const honest = zipSync({ "bomb.png": payload }, { level: 6 });
+  const lying = patchCentralUncompressed(honest, 16);
+  const entry = readZipEntries(lying)[0];
+  assert.equal(entry.uncompressedSize, 16);
+  assert.ok(entry.compressedSize > 1024, "测试包应确实被压缩过");
+
+  const started = performance.now();
+  assert.throws(
+    () => extractZipEntry(lying, entry),
+    /CBZ 解压长度与中央目录不一致|这一页解压后太大/
+  );
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 200, "说谎尺寸应快速截断，实际耗时 " + elapsed.toFixed(1) + "ms");
+});

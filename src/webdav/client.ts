@@ -63,6 +63,15 @@ export function encodePath(path: string): string {
     .join("/");
 }
 
+/** 拒绝路径里的 .. 段（含百分号编码形式），绝对 URL 与相对路径都要过。 */
+function assertNoTraversalPath(path: string, context: string): void {
+  for (const segment of String(path ?? "").split("/")) {
+    if (decodePercentSafe(segment) === "..") {
+      throw new Error(context + "里不能包含 ..（上级目录）");
+    }
+  }
+}
+
 function encodeAbsoluteUrl(url: string): string {
   const matched = /^([a-z][a-z0-9+.-]*:\/\/[^/?#]+)([^?#]*)([\s\S]*)$/i.exec(url);
   if (!matched) {
@@ -70,6 +79,7 @@ function encodeAbsoluteUrl(url: string): string {
   }
   const origin = matched[1].replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, "$1");
   const path = matched[2] === "" ? "/" : matched[2];
+  assertNoTraversalPath(path, "URL 路径");
   return `${origin}${encodePath(path)}${matched[3]}`;
 }
 
@@ -101,8 +111,15 @@ export function originOf(url: string): string {
   if (matched === null) {
     return "";
   }
-  const authority = matched[2].replace(/^.*@/, "");
-  return (matched[1] + "://" + authority).toLowerCase();
+  const scheme = matched[1].toLowerCase();
+  let authority = matched[2].replace(/^.*@/, "").toLowerCase();
+  if (scheme === "http" && authority.endsWith(":80")) {
+    authority = authority.slice(0, -3);
+  }
+  if (scheme === "https" && authority.endsWith(":443")) {
+    authority = authority.slice(0, -4);
+  }
+  return scheme + "://" + authority;
 }
 
 /** 相对路径拼到根 URL 上；绝对 URL 只允许同 origin，且只做安全编码。 */
@@ -119,6 +136,7 @@ export function resolveUrl(rootUrl: string, input: string): string {
   }
   const base = rootUrl.replace(/\/+$/, "");
   const suffix = raw === "" ? "/" : raw.startsWith("/") ? raw : `/${raw}`;
+  assertNoTraversalPath(suffix, "URL 路径");
   return `${base}${encodePath(suffix)}`;
 }
 

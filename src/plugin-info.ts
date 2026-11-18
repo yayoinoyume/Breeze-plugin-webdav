@@ -1,4 +1,4 @@
-import type { InfoContract } from "breeze-plugin-kit";
+import type { InfoContract, PluginFunctionItem } from "breeze-plugin-kit";
 
 /** npm 包名，必须与 package.json 的 name 一致。 */
 export const NPM_NAME = "breeze-plugin-webdav";
@@ -11,6 +11,36 @@ export const PLUGIN_ID = "a7d0c1f4-5b2e-4c93-9d61-3f2b8e7a4c10";
 
 export const PLUGIN_VERSION = "0.1.0";
 
+function buildFunctionEntries(): PluginFunctionItem[] {
+  return [
+    {
+      id: "library",
+      title: "漫画库",
+      action: {
+        type: "openComicList",
+        payload: {
+          scene: {
+            title: "漫画库",
+            source: PLUGIN_ID,
+            body: {
+              type: "pluginPagedComicList",
+              request: { fnPath: "getComicList", core: {}, extern: {} }
+            }
+          }
+        }
+      }
+    },
+    {
+      id: "search",
+      title: "搜索",
+      action: {
+        type: "openSearch",
+        payload: { source: PLUGIN_ID, extern: {} }
+      }
+    }
+  ];
+}
+
 export function buildPluginInfo(): InfoContract {
   return {
     name: PLUGIN_NAME,
@@ -19,6 +49,6 @@ export function buildPluginInfo(): InfoContract {
     describe: "通过 WebDAV 读取 NAS / 网盘上的漫画：目录浏览、按页取图、整包下载 CBZ。",
     version: PLUGIN_VERSION,
     npmName: NPM_NAME,
-    function: []
+    function: buildFunctionEntries()
   };
 }

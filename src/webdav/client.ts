@@ -28,6 +28,8 @@ export type WebDavClient = {
   urlFor(input: string): string;
   propfind(input: string, depth?: number): Promise<DavEntry[]>;
   list(input?: string, depth?: number): Promise<DavEntry[]>;
+  /** 把服务器返回的 href 换算成相对根路径的路径；不在根路径下返回 null。 */
+  relativePath(href: string): string | null;
   fetchBytes(input: string): Promise<HttpResponseData>;
 };
 
@@ -166,11 +168,49 @@ function toPathKey(value: string): string {
   return path;
 }
 
-function describeHttpError(method: string, url: string, response: HttpResponseData): Error {
-  if (response.status === 401 || response.status === 403) {
-    return new Error(`WebDAV 认证失败（HTTP ${response.status}）：${method} ${url}`);
+function rawUrlPath(value: string): string {
+  let path = String(value ?? "");
+  const origin = /^[a-z][a-z0-9+.-]*:\/\/[^/]*/i.exec(path);
+  if (origin) {
+    path = path.slice(origin[0].length) || "/";
   }
-  return new Error(`WebDAV 请求失败（HTTP ${response.status}）：${method} ${url}`);
+  const cut = path.search(/[?#]/);
+  if (cut >= 0) {
+    path = path.slice(0, cut);
+  }
+  if (!path.startsWith("/")) {
+    path = "/" + path;
+  }
+  return path;
+}
+
+/** 把 href 换算成「相对扫描根路径」的路径（已解码，以 / 开头）。 */
+export function hrefToRelativePath(href: string, rootUrl: string): string | null {
+  const hrefPath = toPathKey(rawUrlPath(href));
+  const rootPath = toPathKey(rawUrlPath(rootUrl));
+  if (hrefPath === rootPath) {
+    return "/";
+  }
+  if (rootPath === "/") {
+    return hrefPath;
+  }
+  if (!hrefPath.startsWith(rootPath + "/")) {
+    return null;
+  }
+  return hrefPath.slice(rootPath.length);
+}
+
+function describeHttpError(method: string, url: string, response: HttpResponseData): Error {
+  const status = response.status;
+  if (status === 401 || status === 403) {
+    return new Error("网盘用户名或密码不对（HTTP " + status + "）：" + method + " " + url);
+  }
+  if (method === "PROPFIND" && (status === 405 || status === 501)) {
+    return new Error(
+      "这个网盘不支持列目录（PROPFIND），换一个 WebDAV 地址试试（HTTP " + status + "）"
+    );
+  }
+  return new Error("WebDAV 请求失败（HTTP " + status + "）：" + method + " " + url);
 }
 
 export function createWebDavClient(options: WebDavClientOptions): WebDavClient {
@@ -216,6 +256,9 @@ export function createWebDavClient(options: WebDavClientOptions): WebDavClient {
       const entries = await client.propfind(input, depth);
       const selfKey = toPathKey(url);
       return entries.filter((entry) => toPathKey(entry.href) !== selfKey);
+    },
+    relativePath(href) {
+      return hrefToRelativePath(href, rootUrl);
     },
     async fetchBytes(input) {
       const url = client.urlFor(input);

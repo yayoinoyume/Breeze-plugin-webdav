@@ -66,10 +66,12 @@ async function requestWithRetry(
 
 function assertDownloadable(method: string, url: string, response: HttpResponseData): void {
   if (response.status === 401 || response.status === 403) {
-    throw new Error(`WebDAV 认证失败（HTTP ${response.status}）：${method} ${url}`);
+    throw new Error(
+      "网盘用户名或密码不对（HTTP " + response.status + "）：" + method + " " + url
+    );
   }
   if (response.status !== 200 && response.status !== 206) {
-    throw new Error(`WebDAV 请求失败（HTTP ${response.status}）：${method} ${url}`);
+    throw new Error("WebDAV 请求失败（HTTP " + response.status + "）：" + method + " " + url);
   }
 }
 

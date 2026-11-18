@@ -1,5 +1,5 @@
 /**
- * 插件入口：导出宿主调用的函数，同时暴露核心网络层给测试与后续业务使用。
+ * 插件入口：导出宿主调用的函数，同时暴露核心能力给测试。
  */
 
 export { getInfo, getSettingsBundle } from "./plugin.ts";
@@ -19,6 +19,7 @@ export {
   encodeBase64Utf8,
   encodePath,
   fetchFileBytes,
+  hrefToRelativePath,
   listDirectory,
   normalizeBaseUrl,
   resolveUrl
@@ -40,4 +41,54 @@ export {
   loadSettings
 } from "./settings.ts";
 export type { WebDavSettings } from "./settings.ts";
+export {
+  encodeComicId,
+  decodeComicId,
+  encodePageUrl,
+  encodePathId,
+  decodePathId,
+  parsePageUrl
+} from "./webdav/ids.ts";
+export type { ComicKind, ComicRef } from "./webdav/ids.ts";
+export { scanComics, sortImagePaths } from "./webdav/scan.ts";
+export type { ComicEntry, ComicLister, ScanOptions } from "./webdav/scan.ts";
+export { extractZipEntry, listZipImages, readZipEntries } from "./zip/cbz.ts";
+export type { ZipEntry } from "./zip/cbz.ts";
+export {
+  baseName,
+  comicTitle,
+  isCbzFile,
+  isImageFile,
+  naturalCompare,
+  normalizeDavPath,
+  stripArchiveExtension
+} from "./util/names.ts";
+export {
+  USER_MESSAGES,
+  friendlyMessage,
+  toFriendlyError,
+  withFriendlyErrors
+} from "./errors.ts";
+export {
+  MAIN_CHAPTER_NAME,
+  SEARCH_PAGE_SIZE,
+  buildChapterWithPages,
+  buildListItem,
+  clearZipCache,
+  clientForSettings,
+  fetchImageBytes,
+  fetchPageBytes,
+  filterComics,
+  getChapter,
+  getComicDetail,
+  getComicList,
+  getReadSnapshot,
+  listComicEntries,
+  paginateComics,
+  resolveComicRef,
+  searchComic,
+  searchComicsWith,
+  zipCachePaths
+} from "./comics.ts";
+export type { PageSlice } from "./comics.ts";
 export { default } from "./plugin.ts";

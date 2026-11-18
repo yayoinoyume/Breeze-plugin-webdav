@@ -66,7 +66,7 @@ export const hostRequest: HostRequest = async (spec) => {
   const bridge = (globalThis as unknown as { __http_request_promise?: HttpBridge })
     .__http_request_promise;
   if (typeof bridge !== "function") {
-    throw new Error("当前环境没有 __http_request_promise，无法发送 WebDAV 请求");
+    throw new Error("当前 Breeze 版本太旧，插件用不了（缺少 __http_request_promise）");
   }
 
   const raw = await bridge(

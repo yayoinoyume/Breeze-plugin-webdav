@@ -1,6 +1,14 @@
 import type { InfoContract, SettingsBundleContract } from "breeze-plugin-kit";
 import { buildPluginInfo } from "./plugin-info.ts";
 import { buildSettingsBundle } from "./settings.ts";
+import {
+  fetchImageBytes,
+  getChapter,
+  getComicDetail,
+  getComicList,
+  getReadSnapshot,
+  searchComic
+} from "./comics.ts";
 
 /** 插件元信息（宿主信息页 / manifest 共用）。 */
 export function getInfo(): InfoContract {
@@ -14,7 +22,13 @@ export function getSettingsBundle(): Promise<SettingsBundleContract> {
 
 const plugin = {
   getInfo,
-  getSettingsBundle
+  getSettingsBundle,
+  searchComic,
+  getComicList,
+  getComicDetail,
+  getReadSnapshot,
+  getChapter,
+  fetchImageBytes
 };
 
 export default plugin;

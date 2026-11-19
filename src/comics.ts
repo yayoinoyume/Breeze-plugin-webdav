@@ -75,6 +75,13 @@ type CachedZip = {
 const zipCache: CachedZip[] = [];
 const inflightZip = new Map<string, Promise<Uint8Array>>();
 
+/**
+ * 坏包负缓存：200 回退体自校验失败后，60 秒内同一个包直接报同一个错误，
+ * 不再为了每一页重新下载整个坏包。
+ */
+const ZIP_REJECT_TTL_MS = 60 * 1000;
+const rejectedZipBodies = new Map<string, { message: string; at: number }>();
+
 /** 中央目录缓存上限：每个包几十 KB，只缓存小索引，不缓存整包。 */
 const REMOTE_ZIP_CACHE_LIMIT = 16;
 const REMOTE_ZIP_CACHE_BUDGET_BYTES = 8 * 1024 * 1024;
@@ -118,6 +125,7 @@ export function clearZipCache(): void {
   inflightZip.clear();
   zipCacheBudget = ZIP_CACHE_BUDGET_BYTES;
   remoteZipDownloadLimit = MAX_DOWNLOAD_BYTES;
+  rejectedZipBodies.clear();
   clearRemoteZipCache();
   clearRemoteZipDiagnostics();
 }
@@ -533,6 +541,13 @@ function zipPage(comicPath: string, entry: ZipEntry, index: number): ChapterPage
 
 async function loadZipBytes(client: WebDavClient, path: string): Promise<Uint8Array> {
   const key = zipCacheKey(client, path);
+  const rejected = rejectedZipBodies.get(key);
+  if (rejected !== undefined) {
+    if (Date.now() - rejected.at <= ZIP_REJECT_TTL_MS) {
+      throw new Error(rejected.message);
+    }
+    rejectedZipBodies.delete(key);
+  }
   const hit = zipCache.findIndex((entry) => entry.key === key);
   if (hit >= 0) {
     const cached = zipCache.splice(hit, 1)[0];
@@ -602,9 +617,12 @@ function trimRemoteZipCache(): void {
 /** 回退诊断的账号维度：换账号时把去重键集合复位，避免旧账号的键压掉新账号的诊断。 */
 let remoteZipDiagnosticAccount = "";
 
-function resetRemoteZipDiagnosticKeysForAccount(key: string): void {
-  const separator = key.lastIndexOf("|");
-  const account = separator >= 0 ? key.slice(0, separator) : key;
+/** 直接生成账号键：path 里带 | 也不会串（不能从 zipCacheKey 反解）。 */
+function zipCacheAccount(client: WebDavClient): string {
+  return client.baseUrl + "\u0001" + String(client.options.username ?? "");
+}
+
+function resetRemoteZipDiagnosticKeysForAccount(account: string): void {
   if (remoteZipDiagnosticAccount === account) {
     return;
   }
@@ -640,7 +658,7 @@ function rememberRemoteZipFallback(
   if (cachedIndex >= 0) {
     remoteZipCache.splice(cachedIndex, 1);
   }
-  resetRemoteZipDiagnosticKeysForAccount(key);
+  resetRemoteZipDiagnosticKeysForAccount(zipCacheAccount(client));
   const dedupe = key + "|" + kind;
   if (remoteZipDiagnosticKeys.has(dedupe)) {
     return;
@@ -658,16 +676,17 @@ function assertZipBodyCacheable(
   path: string,
   bytes: Uint8Array
 ): void {
+  const key = zipCacheKey(client, path);
   try {
     readZipEntries(bytes);
+    rejectedZipBodies.delete(key);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     if (reason.includes("ZIP64")) {
       // 结构完整只是格式太新：允许进缓存，让解包路径给「暂不支持 ZIP64」的明确错误。
       return;
     }
-    const key = zipCacheKey(client, path);
-    resetRemoteZipDiagnosticKeysForAccount(key);
+    resetRemoteZipDiagnosticKeysForAccount(zipCacheAccount(client));
     const dedupe = key + "|body-invalid";
     if (!remoteZipDiagnosticKeys.has(dedupe)) {
       remoteZipDiagnosticKeys.add(dedupe);
@@ -676,9 +695,10 @@ function assertZipBodyCacheable(
         "服务器返回的 CBZ 不是有效的 ZIP，已丢弃且不缓存（" + path + "）：" + reason
       );
     }
-    throw new Error(
-      "服务器返回的 CBZ 不是有效的 ZIP（中央目录读不出来），已丢弃且不缓存：" + reason
-    );
+    const message =
+      "服务器返回的 CBZ 不是有效的 ZIP（中央目录读不出来），已丢弃且不缓存：" + reason;
+    rejectedZipBodies.set(key, { message, at: Date.now() });
+    throw new Error(message);
   }
 }
 
@@ -687,8 +707,12 @@ function assertZipBodyCacheable(
  * 进缓存前必须先证明它是能读出中央目录的真包，坏体（被截断 / 换过文件）不缓存。
  */
 function seedZipCache(client: WebDavClient, path: string, bytes: Uint8Array): void {
-  assertZipBodyCacheable(client, path, bytes);
   const key = zipCacheKey(client, path);
+  // 并发回退时多个等待者都会走到这里：已经在缓存里就不必再解析一遍。
+  if (zipCache.some((entry) => entry.key === key)) {
+    return;
+  }
+  assertZipBodyCacheable(client, path, bytes);
   const hit = zipCache.findIndex((entry) => entry.key === key);
   if (hit >= 0) {
     zipCache.splice(hit, 1);

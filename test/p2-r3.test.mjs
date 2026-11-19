@@ -113,12 +113,21 @@ test("full-body-selfcheck 200 回退体不是合法 ZIP 时不进缓存并给明
   const firstRound = requests.filter((spec) => spec.method === "GET").length;
   assert.ok(firstRound >= 1, "至少要发过一次 GET");
 
-  // 第二次仍然要重新向服务器要（说明坏体没被当缓存复用）。
-  await assert.rejects(() => comics.fetchPageBytes(client, { kind: "cbz", path: "/坏体.cbz", index: 0 }));
-  assert.ok(
-    requests.filter((spec) => spec.method === "GET").length > firstRound,
-    "坏体不缓存，第二次必须重新请求服务器"
+  // 坏体会进 60 秒负缓存：第二次直接报同一个明确错误，不再重复下载整个坏包（P2-8）。
+  let secondMessage = "";
+  await assert.rejects(
+    () => comics.fetchPageBytes(client, { kind: "cbz", path: "/坏体.cbz", index: 0 }),
+    (error) => {
+      secondMessage = error.message;
+      return true;
+    }
   );
+  assert.equal(
+    requests.filter((spec) => spec.method === "GET").length,
+    firstRound,
+    "坏体负缓存命中时不得再发 GET"
+  );
+  assert.match(secondMessage, /不是有效的 ZIP.*不缓存/, "第二次也要给同一个明确错误");
   assert.deepEqual(comics.zipCachePaths(), []);
   comics.clearZipCache();
 });

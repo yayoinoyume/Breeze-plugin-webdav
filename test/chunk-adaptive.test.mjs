@@ -143,7 +143,12 @@ test("chunk-adaptive-slow 1 Mbps 下自适应把块压到 8 MiB 以下并下载�
 
   const diagnostics = getChunkDiagnostics().join("\n");
   assert.match(diagnostics, /吞吐探测/, "要有探测日志");
-  assert.match(diagnostics, /减半|缩小/, "慢块之后要有缩小日志");
+  // 公式按 15 秒目标切块，慢阈值 25 秒：正常 1 Mbps 链路不该自我减半（P2-2）。
+  assert.doesNotMatch(diagnostics, /减半|缩小/, "正常链路不该被判慢减半");
+  assert.ok(
+    Math.max(...sizes) <= 4 * MiB,
+    "1 Mbps 下块应是公式值（约 1.8 MiB），实际最大 " + Math.max(...sizes)
+  );
 });
 
 test("chunk-adaptive-fast 高速链路把块放大到 8 MiB 以上且不超过 16 MiB", async () => {
@@ -188,11 +193,12 @@ test("chunk-adaptive-fast 高速链路把块放大到 8 MiB 以上且不超过 1
   });
   assert.equal(secondResult.bytes.length, small.length);
   const secondGets = second.calls.filter((spec) => spec.method === "GET");
-  assert.equal(secondGets.length, 1, "吞吐已缓存时 2 MiB 包应一次 GET 完成，实际 " + secondGets.length);
+  assert.equal(secondGets.length, 1, "吞吐已缓存时 2 MiB 包应一次请求完成，实际 " + secondGets.length);
+  const secondRange = secondGets[0].headers?.Range;
   assert.equal(
-    secondGets[0].headers?.Range,
-    undefined,
-    "缓存命中后不应再发 1 MiB 探测请求，实际带了 " + String(secondGets[0].headers?.Range)
+    secondRange,
+    "bytes=0-2097151",
+    "缓存命中后直接按整包大小分一块（不再发 1 MiB 探测），实际 " + String(secondRange)
   );
   assert.ok(before >= 2, "第一次下载应至少发过探测 + 分块请求，实际 " + before);
   assert.ok(MIN_CHUNK_SIZE < DEFAULT_CHUNK_SIZE);

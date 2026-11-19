@@ -213,15 +213,74 @@ export async function scanComicsDetailed(
   let skippedEntries = 0;
   let maxInFlight = 0;
 
+  let fatalError: unknown = null;
+  let hasFatal = false;
+
   while (queue.length > 0) {
     const layer = queue;
     queue = [];
     const outcomes: Array<ListOutcome | null> = new Array(layer.length).fill(null);
     let nextIndex = 0;
+    let nextMerge = 0;
     let inFlight = 0;
+
+    /**
+     * 按层内下标顺序增量合并：只有前面的目录都回来了才合并后面的，
+     * 所以结果顺序与串行一致；一旦达到 maxComics 就停机，不再把同层剩余目录列完。
+     */
+    const mergeReady = (): void => {
+      while (
+        !hasFatal &&
+        !stoppedByMax &&
+        nextMerge < layer.length &&
+        outcomes[nextMerge] !== null
+      ) {
+        const outcome = outcomes[nextMerge] as ListOutcome;
+        const job = layer[nextMerge];
+        outcomes[nextMerge] = null;
+        nextMerge += 1;
+
+        if (outcome.failed) {
+          if (job.depth === 0) {
+            hasFatal = true;
+            fatalError = outcome.error;
+            return;
+          }
+          skippedEntries += 1;
+          continue;
+        }
+
+        skippedEntries += outcome.skipped;
+        for (const comic of outcome.comics) {
+          if (comics.length >= maxComics) {
+            stoppedByMax = true;
+            break;
+          }
+          if (seen.has(comic.path)) {
+            continue;
+          }
+          seen.add(comic.path);
+          comics.push(comic);
+        }
+        if (stoppedByMax) {
+          return;
+        }
+        for (const child of outcome.children) {
+          queue.push(child);
+        }
+      }
+    };
 
     const worker = async (): Promise<void> => {
       for (;;) {
+        if (hasFatal || stoppedByMax) {
+          return;
+        }
+        // 与串行 while 条件一致：先看 maxComics，再看预算（否则会多列一本、并出假预算 warning）。
+        if (comics.length >= maxComics) {
+          stoppedByMax = true;
+          return;
+        }
         if (budgetStopped) {
           return;
         }
@@ -248,10 +307,7 @@ export async function scanComicsDetailed(
         );
         inFlight -= 1;
         outcomes[index] = outcome;
-        if (outcome.failed && layer[index].depth === 0) {
-          // 根层失败：立刻停手，由下面的合并阶段抛出原始错误。
-          return;
-        }
+        mergeReady();
       }
     };
 
@@ -261,38 +317,9 @@ export async function scanComicsDetailed(
       workers.push(worker());
     }
     await Promise.all(workers);
-
-    // 按「层内服务器返回顺序」逐目录合并：并发只影响谁先回来，不影响结果顺序。
-    for (let index = 0; index < outcomes.length; index += 1) {
-      const outcome = outcomes[index];
-      if (outcome === null) {
-        continue;
-      }
-      if (outcome.failed) {
-        if (layer[index].depth === 0) {
-          throw outcome.error;
-        }
-        skippedEntries += 1;
-        continue;
-      }
-      skippedEntries += outcome.skipped;
-      for (const comic of outcome.comics) {
-        if (comics.length >= maxComics) {
-          stoppedByMax = true;
-          break;
-        }
-        if (seen.has(comic.path)) {
-          continue;
-        }
-        seen.add(comic.path);
-        comics.push(comic);
-      }
-      if (stoppedByMax) {
-        break;
-      }
-      for (const child of outcome.children) {
-        queue.push(child);
-      }
+    mergeReady();
+    if (hasFatal) {
+      throw fatalError;
     }
     if (stoppedByMax || comics.length >= maxComics) {
       break;

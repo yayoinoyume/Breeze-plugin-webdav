@@ -15,14 +15,17 @@ import type { HostRequest, HttpResponseData } from "./host.ts";
 import { redactUrl } from "../errors.ts";
 
 export const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
-export const MIN_CHUNK_SIZE = 1 * 1024 * 1024;
+export const MIN_CHUNK_SIZE = 256 * 1024;
 export const MAX_CHUNK_SIZE = 16 * 1024 * 1024;
 /** 吞吐探测块大小：1 MiB 在 1 Mbps 上约 8 秒，探测本身不会撞 30 秒超时。 */
 export const PROBE_CHUNK_BYTES = 1 * 1024 * 1024;
-/** 目标「一块下多久」：按吞吐 × 25 秒切块，留 5 秒给建连与抖动。 */
-export const CHUNK_TARGET_MS = 25_000;
-/** 单块超过这个耗时就算慢，下一块减半。 */
-export const SLOW_CHUNK_MS = 20_000;
+/**
+ * 目标「一块下多久」：按吞吐 × 15 秒切块。
+ * 必须明显小于下面的慢阈值，否则公式选出的块天然被判慢、每次都自我减半。
+ */
+export const CHUNK_TARGET_MS = 15_000;
+/** 单块超过 25 秒（= 目标的 1.67 倍）才算慢，下一块减半；给宿主 30 秒超时留余量。 */
+export const SLOW_CHUNK_MS = 25_000;
 /** 连续两块都快于这个耗时，下一块翻倍。 */
 export const FAST_CHUNK_MS = 3_000;
 /** 吞吐缓存有效期（按 host + 账号复用，避免每页都探测）。 */
@@ -358,7 +361,7 @@ function assertWholeLength(bytes: Uint8Array, total: number, url: string): void 
 
 /**
  * 吞吐探测：Range 拉 1 MiB 并计时。拿到的字节直接算作第一块（调用方放进输出缓冲），
- * 不会为了「量速率」多下载一遍。
+ * 不会为了「量速率」多下载一遍。探测失败只降级、不抛（401/403 除外）。
  */
 async function probeThroughput(
   request: HostRequest,
@@ -400,8 +403,9 @@ async function probeThroughput(
   }
 
   const elapsed = Math.max(1, now() - startedAt);
-  assertDownloadable("GET", url, response);
-
+  if (response.status === 401 || response.status === 403) {
+    assertDownloadable("GET", url, response);
+  }
   if (response.status === 200) {
     if (response.bytes.length === total) {
       log(
@@ -409,11 +413,33 @@ async function probeThroughput(
       );
       return { kind: "whole", bytes: response.bytes };
     }
+    if (response.bytes.length < total) {
+      // 服务器忽略 Range 但这次只收了个前缀（还没收完就断了）：当第一块用，别整包重下。
+      log(
+        "吞吐探测拿到 200 前缀（" +
+          response.bytes.length +
+          " / " +
+          total +
+          " 字节），当作第一块继续分块"
+      );
+      return { kind: "body", bytes: response.bytes, bytesPerMs: 0 };
+    }
     log(
-      "吞吐探测拿到 200 但长度与预期不符（" +
+      "吞吐探测拿到的 200 体比预期长（" +
         response.bytes.length +
-        " / " +
+        " > " +
         total +
+        "），丢弃并按默认 " +
+        describeBytes(DEFAULT_CHUNK_SIZE) +
+        " 分块"
+    );
+    return { kind: "none" };
+  }
+  if (response.status !== 206) {
+    // 5xx / 408 / 429 / 404 … 一律降级：探测只是优化，不该让下载直接失败。
+    log(
+      "吞吐探测失败（HTTP " +
+        response.status +
         "），按默认 " +
         describeBytes(DEFAULT_CHUNK_SIZE) +
         " 分块"
@@ -491,33 +517,31 @@ export async function downloadFileBytes(
   let offset = 0;
   let chunkCount = 0;
   let chunkSize = explicitChunk ?? DEFAULT_CHUNK_SIZE;
+  // 自适应且文件大于下限：一律走分块循环（哪怕只剩一块），失败才有机会减半。
+  const chunkLoop = explicitChunk === null && adaptive && total > MIN_CHUNK_SIZE;
 
-  if (explicitChunk === null) {
-    if (!adaptive) {
-      chunkSize = DEFAULT_CHUNK_SIZE;
-    } else if (total <= MIN_CHUNK_SIZE) {
-      // 不到 1 MiB 的包在 1 Mbps 上也只要 8 秒，不必探测：一次 GET 拿完。
-      chunkSize = Math.max(1, total);
-    } else {
-      const probed = await probeThroughput(request, url, headers, total, now, log);
-      if (probed.kind === "whole") {
-        assertWholeLength(probed.bytes, total, url);
-        return { bytes: probed.bytes, status: 200, chunkCount: 1, usedRange: false };
-      }
-      if (probed.kind === "body") {
-        output.set(probed.bytes, 0);
-        offset = probed.bytes.length;
-        chunkCount = 1;
-      }
-      if (probed.kind === "body" || probed.kind === "rate") {
-        chunkSize = chunkSizeFor(probed.bytesPerMs);
-      } else {
-        chunkSize = DEFAULT_CHUNK_SIZE;
-      }
+  if (chunkLoop) {
+    const probed = await probeThroughput(request, url, headers, total, now, log);
+    if (probed.kind === "whole") {
+      assertWholeLength(probed.bytes, total, url);
+      return { bytes: probed.bytes, status: 200, chunkCount: 1, usedRange: false };
     }
+    if (probed.kind === "body") {
+      output.set(probed.bytes, 0);
+      offset = probed.bytes.length;
+      chunkCount = 1;
+      chunkSize = chunkSizeFor(probed.bytesPerMs);
+    } else if (probed.kind === "rate") {
+      chunkSize = chunkSizeFor(probed.bytesPerMs);
+    } else {
+      chunkSize = DEFAULT_CHUNK_SIZE;
+    }
+  } else if (explicitChunk === null) {
+    // 不到 256 KiB 的包：一次 GET 拿完，不必探测。
+    chunkSize = Math.max(1, total);
   }
 
-  if (offset === 0 && total <= chunkSize) {
+  if (!chunkLoop && offset === 0 && total <= chunkSize) {
     const response = await requestWithRetry(request, { method: "GET", url, headers }, retries);
     assertDownloadable("GET", url, response);
     assertWholeLength(response.bytes, total, url);
@@ -535,26 +559,57 @@ export async function downloadFileBytes(
   while (offset < total) {
     const end = Math.min(offset + chunkSize, total) - 1;
     const startedAt = now();
-    let response: HttpResponseData;
-    try {
-      response = await requestWithRetry(
-        request,
-        {
-          method: "GET",
-          url,
-          headers: { ...headers, Range: "bytes=" + offset + "-" + end }
-        },
-        shrinkRetries === 0 ? retries : 0
-      );
-    } catch (error) {
-      // 慢网络最常见的失败就是宿主 30 秒超时：把块减半后重试同一段，而不是整包失败。
+    const spec = {
+      method: "GET",
+      url,
+      headers: { ...headers, Range: "bytes=" + offset + "-" + end }
+    } as const;
+
+    let response: HttpResponseData | null = null;
+    let failure: unknown = null;
+    let statusAttempt = 0;
+    for (;;) {
+      try {
+        const candidate = await request(spec);
+        if (!isRetryableStatus(candidate.status)) {
+          response = candidate;
+          break;
+        }
+        failure = new Error(
+          "服务器返回 HTTP " +
+            candidate.status +
+            "：" +
+            spec.method +
+            " " +
+            redactUrl(spec.url)
+        );
+        if (statusAttempt >= retries) {
+          break;
+        }
+        statusAttempt += 1;
+        await wait(300 * Math.pow(2, statusAttempt - 1));
+      } catch (error) {
+        failure = error;
+        // 自适应：网络错误 / 宿主超时不原块重试（真实网络会白等两分钟），直接去减半。
+        // 固定块大小（测试 / E2E 显式传 chunkSize）保持原来的重试行为。
+        if (!adaptive && !isAuthFailure(error) && statusAttempt < retries) {
+          statusAttempt += 1;
+          failure = null;
+          await wait(300 * Math.pow(2, statusAttempt - 1));
+          continue;
+        }
+        break;
+      }
+    }
+
+    if (failure !== null) {
       if (
         !adaptive ||
-        isAuthFailure(error) ||
+        isAuthFailure(failure) ||
         chunkSize <= MIN_CHUNK_SIZE ||
         shrinkRetries >= MAX_SHRINK_RETRIES
       ) {
-        throw error;
+        throw failure;
       }
       shrinkRetries += 1;
       fastStreak = 0;
@@ -564,16 +619,20 @@ export async function downloadFileBytes(
         "分块 " +
           describeBytes(previous) +
           " 失败（" +
-          describeError(error) +
-          "），块大小减半到 " +
-          describeBytes(chunkSize)
+          describeError(failure) +
+          "），块大小先减半到 " +
+          describeBytes(chunkSize) +
+          " 再重试"
       );
       continue;
     }
+    if (response === null) {
+      throw new Error("分块请求没有返回响应");
+    }
 
     const elapsed = now() - startedAt;
-    chunkCount += 1;
     assertDownloadable("GET", url, response);
+    chunkCount += 1;
 
     if (response.status === 200) {
       // 服务器忽略 Range，直接给整包。
@@ -591,7 +650,7 @@ export async function downloadFileBytes(
       range === null ||
       range.start !== offset ||
       range.end !== end ||
-      range.total !== total
+      (range.total !== null && range.total !== total)
     ) {
       throw new Error(
         "服务器返回的 Content-Range 与请求不一致（请求 bytes=" +

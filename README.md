@@ -13,20 +13,22 @@
 
 ## 在 Breeze 里安装
 
-1. pnpm build，然后在仓库里起静态服务器：
+插件从 GitHub Release 分发，直接装产物文件即可。
 
-   ~~~bash
-   python3 -m http.server 7878 --directory dist
-   ~~~
+1. 打开 https://github.com/yayoinoyume/breeze-plugin-webdav/releases/latest ，下载最新的 breeze-plugin-webdav.bundle.cjs；
+2. 或者直接复制该 Release 的资源直链，形如：
 
-   让手机和电脑在同一局域网，确认 http://<电脑IP>:7878/breeze-plugin-webdav.bundle.cjs 可访问。
-2. Breeze → 发现页 → 插件商店 → 浏览安装 → 网络安装，填入上面的 bundle 地址。
-3. 进入插件设置，填服务器与扫描参数（见下一节）。
-4. 发现页会出现两个入口：
-   - **漫画库**：按设置扫描出的漫画列表；
-   - **搜索**：Breeze 搜索页，输入关键词过滤漫画名。
+   https://github.com/yayoinoyume/breeze-plugin-webdav/releases/download/v0.3.0/breeze-plugin-webdav.bundle.cjs
 
-   设置页通过 Breeze 的「插件设置」进入，不用单独入口。
+3. Breeze → 发现页 → 插件商店 → 网络安装 → 粘贴上面的直链 → 安装；
+4. 也可以把文件下载到手机，用「本地文件安装」选它。文件名必须以 .cjs / .js / .br 结尾（安卓浏览器 / 下载器有时会把文件名改成 .bin，需要先改回 .cjs）。
+
+### 安装后
+
+- 进入插件设置，填服务器地址、用户名、密码、漫画库根路径等（参数见下一节）；
+- 发现页出现两个入口：**漫画库**（按设置扫描出的列表）与**搜索**（按关键词过滤漫画名）；
+- 设置页从 Breeze 的「插件设置」进入，不用单独入口。
+
 
 ## 设置项
 

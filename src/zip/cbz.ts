@@ -33,9 +33,15 @@ export type ZipEndRecord = {
   commentLength: number;
 };
 
-export const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
-/** 压缩数据本身的硬上限（deflate 不会比原文大太多；挡住谎报 compressedSize 的包）。 */
-export const MAX_COMPRESSED_ENTRY_BYTES = 64 * 1024 * 1024;
+/**
+ * 单条目解压后的硬上限 65 MiB。
+ *
+ * 64 MiB 会把「恰好 64 MiB + 1 字节」的合法大页误杀，而 deflate 对不可压数据会膨胀
+ * 约 0.02%，所以压缩数据上限再留 1 MiB 余量（两者仍然挡住谎报尺寸的包）。
+ */
+export const MAX_ENTRY_BYTES = 65 * 1024 * 1024;
+/** 压缩数据本身的硬上限：解压上限 + deflate 膨胀余量。 */
+export const MAX_COMPRESSED_ENTRY_BYTES = MAX_ENTRY_BYTES + 1024 * 1024;
 export const MAX_COMPRESSION_RATIO = 1000;
 export const LOCAL_HEADER_BYTES = 30;
 const INFLATE_INPUT_CHUNK = 8 * 1024;

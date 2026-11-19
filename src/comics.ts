@@ -95,7 +95,7 @@ const remoteZipCache: CachedRemoteZip[] = [];
 const inflightRemoteZip = new Map<string, Promise<RemoteZipInfo>>();
 /** 判定过「服务器不支持 Range」的包：之后的取页直接走整包，不再重复试错。 */
 const remoteZipFallbackKeys = new Set<string>();
-const remoteZipDiagnostics: string[] = [];
+const remoteZipDiagnostics: Array<{ key: string; text: string }> = [];
 const remoteZipDiagnosticKeys = new Set<string>();
 
 type ScanCacheEntry = {
@@ -112,12 +112,14 @@ type ComicRef = {
   path: string;
 };
 
-/** 清空模块内 CBZ 缓存（测试用）。 */
+/** 清空模块内 CBZ 缓存（测试用）：整包、中央目录、回退诊断与预算一起复位。 */
 export function clearZipCache(): void {
   zipCache.length = 0;
   inflightZip.clear();
   zipCacheBudget = ZIP_CACHE_BUDGET_BYTES;
+  remoteZipDownloadLimit = MAX_DOWNLOAD_BYTES;
   clearRemoteZipCache();
+  clearRemoteZipDiagnostics();
 }
 
 /** 清空远程 CBZ 的中央目录缓存与「不支持 Range」判定（测试用）。 */
@@ -129,7 +131,7 @@ export function clearRemoteZipCache(): void {
 
 /** 远程取页的回退诊断（回退过一次就有一条，按包去重）。 */
 export function getRemoteZipDiagnostics(): string[] {
-  return remoteZipDiagnostics.slice();
+  return remoteZipDiagnostics.map((entry) => entry.text);
 }
 
 /** 清空远程取页诊断（测试用）。 */
@@ -548,10 +550,15 @@ async function loadZipBytes(client: WebDavClient, path: string): Promise<Uint8Ar
     request: client.options.request
   }).then(
     (result) => {
-      zipCache.unshift({ key, path, bytes: result.bytes });
-      trimZipCache();
-      inflightZip.delete(key);
-      return result.bytes;
+      try {
+        // 下回来的整包同样要先自校验：截断/换包不缓存，直接给明确错误。
+        assertZipBodyCacheable(client, path, result.bytes);
+        zipCache.unshift({ key, path, bytes: result.bytes });
+        trimZipCache();
+        return result.bytes;
+      } finally {
+        inflightZip.delete(key);
+      }
     },
     (error) => {
       inflightZip.delete(key);
@@ -582,12 +589,40 @@ function estimateRemoteZipBytes(info: RemoteZipInfo): number {
 
 function trimRemoteZipCache(): void {
   let total = remoteZipCacheBytes();
-  while (remoteZipCache.length > 1 && total > remoteZipCacheBudget) {
+  // 允许逐出最后一条：预算比单个包还小时，「至少留一条」等于预算永远不生效。
+  while (remoteZipCache.length >= 1 && total > remoteZipCacheBudget) {
     const removed = remoteZipCache.pop();
     if (removed === undefined) {
       break;
     }
     total -= removed.bytes;
+  }
+}
+
+/** 回退诊断的账号维度：换账号时把去重键集合复位，避免旧账号的键压掉新账号的诊断。 */
+let remoteZipDiagnosticAccount = "";
+
+function resetRemoteZipDiagnosticKeysForAccount(key: string): void {
+  const separator = key.lastIndexOf("|");
+  const account = separator >= 0 ? key.slice(0, separator) : key;
+  if (remoteZipDiagnosticAccount === account) {
+    return;
+  }
+  remoteZipDiagnosticAccount = account;
+  remoteZipDiagnosticKeys.clear();
+}
+
+/** 诊断数组有上限，被挤掉的条目顺手把去重键也删掉，键集合不会无限增长。 */
+function pushRemoteZipDiagnostic(key: string, text: string): void {
+  remoteZipDiagnostics.push({ key, text });
+  while (remoteZipDiagnostics.length > REMOTE_ZIP_DIAGNOSTIC_LIMIT) {
+    const dropped = remoteZipDiagnostics.shift();
+    if (dropped !== undefined) {
+      remoteZipDiagnosticKeys.delete(dropped.key);
+    }
+  }
+  if (typeof console !== "undefined" && typeof console.warn === "function") {
+    console.warn("[webdav] " + text);
   }
 }
 
@@ -600,23 +635,59 @@ function rememberRemoteZipFallback(
 ): void {
   const key = zipCacheKey(client, path);
   remoteZipFallbackKeys.add(key);
+  // 回退后的包不再需要中央目录索引：顺手释放预算。
+  const cachedIndex = remoteZipCache.findIndex((entry) => entry.key === key);
+  if (cachedIndex >= 0) {
+    remoteZipCache.splice(cachedIndex, 1);
+  }
+  resetRemoteZipDiagnosticKeysForAccount(key);
   const dedupe = key + "|" + kind;
   if (remoteZipDiagnosticKeys.has(dedupe)) {
     return;
   }
   remoteZipDiagnosticKeys.add(dedupe);
-  const text = "CBZ 远程取页不可用，已回退整包下载（" + path + "）：" + reason;
-  remoteZipDiagnostics.push(text);
-  if (remoteZipDiagnostics.length > REMOTE_ZIP_DIAGNOSTIC_LIMIT) {
-    remoteZipDiagnostics.shift();
-  }
-  if (typeof console !== "undefined" && typeof console.warn === "function") {
-    console.warn("[webdav] " + text);
+  pushRemoteZipDiagnostic(
+    dedupe,
+    "CBZ 远程取页不可用，已回退整包下载（" + path + "）：" + reason
+  );
+}
+
+/** 200 回退体进缓存前自校验：读不出中央目录的坏体一律丢弃并留一条诊断。 */
+function assertZipBodyCacheable(
+  client: WebDavClient,
+  path: string,
+  bytes: Uint8Array
+): void {
+  try {
+    readZipEntries(bytes);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (reason.includes("ZIP64")) {
+      // 结构完整只是格式太新：允许进缓存，让解包路径给「暂不支持 ZIP64」的明确错误。
+      return;
+    }
+    const key = zipCacheKey(client, path);
+    resetRemoteZipDiagnosticKeysForAccount(key);
+    const dedupe = key + "|body-invalid";
+    if (!remoteZipDiagnosticKeys.has(dedupe)) {
+      remoteZipDiagnosticKeys.add(dedupe);
+      pushRemoteZipDiagnostic(
+        dedupe,
+        "服务器返回的 CBZ 不是有效的 ZIP，已丢弃且不缓存（" + path + "）：" + reason
+      );
+    }
+    throw new Error(
+      "服务器返回的 CBZ 不是有效的 ZIP（中央目录读不出来），已丢弃且不缓存：" + reason
+    );
   }
 }
 
-/** 回退时如果服务器已经顺带返回了整包，直接塞进 LRU，避免再下载一次。 */
+/**
+ * 回退时如果服务器已经顺带返回了整包，直接塞进 LRU，避免再下载一次。
+ * 进缓存前必须先证明它是能读出中央目录的真包，坏体（被截断 / 换过文件）不缓存。
+ */
 function seedZipCache(client: WebDavClient, path: string, bytes: Uint8Array): void {
+  assertZipBodyCacheable(client, path, bytes);
   const key = zipCacheKey(client, path);
   const hit = zipCache.findIndex((entry) => entry.key === key);
   if (hit >= 0) {

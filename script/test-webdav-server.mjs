@@ -239,7 +239,8 @@ export function createFixture(options = {}) {
       commentInvalid: withZipComment(base, 65535, 1),
       zip64: asZip64Sentinel(base),
       crcMismatch: withBrokenCrc(base, "001.png"),
-      compressedTooLarge: withBrokenCompressedSize(base, 64 * 1024 * 1024 + 1, "001.png"),
+      // 上限是 65 MiB（压缩数据再多留 1 MiB 膨胀余量），所以这里声明 66 MiB + 1。
+      compressedTooLarge: withBrokenCompressedSize(base, 66 * 1024 * 1024 + 1, "001.png"),
       entries: edgeFiles
     };
     rootChildren["注释上限.cbz"] = file(edgeCbz.commentMax);

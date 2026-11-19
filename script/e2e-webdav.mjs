@@ -215,10 +215,49 @@ async function runCbzChain(mod, server, searchItems, expectedPath, zipBytes) {
 
 async function runGroup(mod, server, baseUrl, rootPath, expectedDirPath, expectedCbzPath, zipBytes) {
   await saveSettings(mod, baseUrl, rootPath);
+  const scanStartedAt = performance.now();
   const search = await mod.searchComic({});
+  const scanElapsedMs = Math.round(performance.now() - scanStartedAt);
   check(search.items.length >= 2, "搜索结果至少应包含目录漫画与 CBZ");
   const titles = search.items.map((item) => item.title).join(",");
   console.error("[e2e] " + rootPath + " 搜索结果：" + titles);
+
+  // 扫描耗时 / 并发诊断：真实跑一次扫描，把同层并发与最大在飞数打出来。
+  let scanStats = "并发 未知 最大在飞 未知";
+  if (
+    typeof mod.listComicEntriesDetailed === "function" &&
+    typeof mod.createWebDavClient === "function"
+  ) {
+    const probeClient = mod.createWebDavClient({
+      baseUrl,
+      username: AUTH_USER,
+      password: AUTH_PASS
+    });
+    const detailed = await mod.listComicEntriesDetailed(
+      probeClient,
+      {
+        baseUrl,
+        username: AUTH_USER,
+        password: AUTH_PASS,
+        rootPath,
+        scanDepth: 2,
+        maxComics: 300,
+        includeCbz: true
+      },
+      { force: true }
+    );
+    scanStats =
+      "并发 " +
+      detailed.concurrency +
+      " 最大在飞 " +
+      detailed.maxInFlight +
+      " 列目录 " +
+      detailed.listCalls +
+      " 次（扫描耗时 " +
+      Math.round(detailed.elapsedMs) +
+      "ms）";
+  }
+  console.error("[e2e] " + rootPath + " 扫描耗时 " + scanElapsedMs + "ms " + scanStats);
 
   const dirSha = await runDirChain(mod, server, search.items, expectedDirPath);
   const cbzSha = await runCbzChain(mod, server, search.items, expectedCbzPath, zipBytes);

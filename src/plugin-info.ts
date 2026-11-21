@@ -9,7 +9,7 @@ export const PLUGIN_NAME = "WebDAV 漫画";
 /** 插件 id：随机 uuid v4，建仓时生成后固定，不要修改。 */
 export const PLUGIN_ID = "a7d0c1f4-5b2e-4c93-9d61-3f2b8e7a4c10";
 
-export const PLUGIN_VERSION = "0.3.0";
+export const PLUGIN_VERSION = "0.3.1";
 
 function buildFunctionEntries(): PluginFunctionItem[] {
   return [
@@ -41,14 +41,17 @@ function buildFunctionEntries(): PluginFunctionItem[] {
   ];
 }
 
-export function buildPluginInfo(): InfoContract {
+export function buildPluginInfo(): InfoContract & { creator?: { name: string; describe?: string } } {
   return {
     name: PLUGIN_NAME,
     uuid: PLUGIN_ID,
     iconUrl: "",
     describe: "通过 WebDAV 读取 NAS / 网盘上的漫画：目录浏览、按页取图、CBZ 按需取页（不支持 Range 时回退整包）。",
     version: PLUGIN_VERSION,
+    home: "https://github.com/yayoinoyume/Breeze-plugin-webdav",
+    updateUrl: "https://api.github.com/repos/yayoinoyume/Breeze-plugin-webdav/releases/latest",
     npmName: NPM_NAME,
+    creator: { name: "yayoinoyume", describe: "WebDAV 漫画插件作者" },
     function: buildFunctionEntries()
   };
 }

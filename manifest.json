@@ -3,8 +3,14 @@
   "uuid": "a7d0c1f4-5b2e-4c93-9d61-3f2b8e7a4c10",
   "iconUrl": "",
   "describe": "通过 WebDAV 读取 NAS / 网盘上的漫画：目录浏览、按页取图、CBZ 按需取页（不支持 Range 时回退整包）。",
-  "version": "0.3.0",
+  "version": "0.3.1",
+  "home": "https://github.com/yayoinoyume/Breeze-plugin-webdav",
+  "updateUrl": "https://api.github.com/repos/yayoinoyume/Breeze-plugin-webdav/releases/latest",
   "npmName": "breeze-plugin-webdav",
+  "creator": {
+    "name": "yayoinoyume",
+    "describe": "WebDAV 漫画插件作者"
+  },
   "function": [
     {
       "id": "library",

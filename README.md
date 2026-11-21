@@ -9,16 +9,16 @@
 - 详情页、阅读快照、按页取原图；
 - 错误提示都是中文人话。
 
-当前版本 0.3.0。PDF 不做。
+当前版本 0.3.1。PDF 不做。
 
 ## 在 Breeze 里安装
 
 插件从 GitHub Release 分发，直接装产物文件即可。
 
-1. 打开 https://github.com/yayoinoyume/breeze-plugin-webdav/releases/latest ，下载最新的 breeze-plugin-webdav.bundle.cjs；
+1. 打开 https://github.com/yayoinoyume/Breeze-plugin-webdav/releases/latest （以 latest 为准），下载最新的 breeze-plugin-webdav.bundle.cjs；
 2. 或者直接复制该 Release 的资源直链，形如：
 
-   https://github.com/yayoinoyume/breeze-plugin-webdav/releases/download/v0.3.0/breeze-plugin-webdav.bundle.cjs
+   https://github.com/yayoinoyume/Breeze-plugin-webdav/releases/download/v0.3.1/breeze-plugin-webdav.bundle.cjs
 
 3. Breeze → 发现页 → 插件商店 → 网络安装 → 粘贴上面的直链 → 安装；
 4. 也可以把文件下载到手机，用「本地文件安装」选它。文件名必须以 .cjs / .js / .br 结尾（安卓浏览器 / 下载器有时会把文件名改成 .bin，需要先改回 .cjs）。

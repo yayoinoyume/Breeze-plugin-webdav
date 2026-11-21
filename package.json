@@ -1,6 +1,6 @@
 {
   "name": "breeze-plugin-webdav",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Breeze WebDAV 漫画源插件",
   "type": "module",
   "packageManager": "pnpm@12.16.1",
